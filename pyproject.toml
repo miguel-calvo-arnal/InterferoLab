@@ -1,0 +1,24 @@
+# Tool configuration only — InterferoLab is an application run from a source
+# checkout (see README, Getting started) and packaged with PyInstaller; it is
+# deliberately NOT pip-installable, so there is no [project] metadata table.
+
+[tool.pyside6-project]
+files = ["backend/acquisition/acquisition_controller.py", "main.py", "services/acquisition_service.py", "utils/icons.py", "viewmodels/acquisition_vm.py", "views/AcquisitionPanel.py", "views/ProcessingPanel.py", "widgets/PixelPlotsWidget.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["docs", "dist", "API", "resources", "output", "data/S1F1", "data/S1F5", "logs", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+# Qt uses camelCase in signals/slots/overrides; B008 clashes with Qt defaults
+ignore = ["E501"]
+
+[tool.ruff.format]
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
+addopts = "-q"

@@ -1,0 +1,89 @@
+# =========================================================================
+# Building the C++ backend — notes for Linux and Windows (MSVC + vcpkg)
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# WINDOWS one-time setup
+# -------------------------------------------------------------------------
+# 1. Clone vcpkg into C:\vcpkg (C++ package manager)
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+
+# 2. Bootstrap vcpkg (generates vcpkg.exe)
+C:\vcpkg\bootstrap-vcpkg.bat
+
+# 3. Install Visual Studio BUILD TOOLS (the full IDE is NOT needed).
+#    The Microsoft.VisualStudio.Workload.VCTools workload installs cl.exe,
+#    the MSVC standard library and the complete toolchain (required by the
+#    x64-windows triplet).
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+# 4. Install the dependencies with vcpkg:
+#    - opencv4   -> OpenCV with TIFF support
+#    - tiff      -> libtiff (streaming reads)
+#    - fftw3     -> FFTW with threads, includes fftw3f (float precision)
+C:\vcpkg\vcpkg.exe install opencv4 tiff fftw3[threads] --triplet x64-windows
+
+# -------------------------------------------------------------------------
+# Build directories: build/ is WINDOWS, build-linux/ is LINUX
+# -------------------------------------------------------------------------
+# They are incompatible CMake caches (different generator and source path) and
+# this folder is shared between the Linux host and the Windows VM, so a single
+# build/ would make cmake reject the other platform's cache. build/Release/
+# additionally keeps the vcpkg DLLs that interferolab.spec copies into the
+# Windows bundle: do NOT delete it.
+
+# 1. Configure (once, or when the configuration changes)
+# LINUX:
+#   cmake -S . -B build-linux -DPython3_EXECUTABLE=$PWD/../../.venv/bin/python -DCMAKE_BUILD_TYPE=Release
+# WINDOWS (pybind11_DIR: ask the venv, see the portability note below):
+#   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -Dpybind11_DIR=<venv pybind11 cmakedir> -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_BUILD_TYPE=Release
+
+# 2. Build (-j uses several CPU cores)
+# LINUX:   cmake --build build-linux --config Release -j
+# WINDOWS: cmake --build build       --config Release -j
+
+# 3. Outputs (the version suffix — cp313, cpython-314, ... — depends on the
+#    Python of the venv used to configure: the module ONLY imports from that
+#    version. If the system Python changes, recreate the venv and recompile.)
+# LINUX:
+#   ./build-linux/interferometry
+#   ./build-linux/analysis_backend.cpython-<ver>-x86_64-linux-gnu.so
+# WINDOWS:
+#   ./build/Release/interferometry.exe
+#   ./build/Release/analysis_backend.cp<ver>-win_amd64.pyd
+
+# Or, simpler, the full chain (compile + copy + PyInstaller + release):
+#   scripts/build_release.sh          (Linux)
+#   scripts\build_release.ps1         (Windows; double-click launcher: scripts\build_release.bat)
+
+# -------------------------------------------------------------------------
+# NOTES (July 2026 audit and later)
+# -------------------------------------------------------------------------
+# - WINDOWS venv: the project folder is shared with Linux, so .venv\ holds the
+#   Linux venv and is useless on Windows. The Windows venv goes in .venv-win\
+#   (py -m venv .venv-win); build_release.ps1 finds it by itself, or takes an
+#   explicit one with -VenvDir <path>.
+# - The project venv is created as per the root README.md (Getting started).
+# - Portable pybind11_DIR (avoids hard-coding an absolute user path):
+#     python -m pybind11 --cmakedir
+# - The default build is portable (-march=x86-64-v2). For maximum local
+#   performance: -DINTERFEROLAB_NATIVE_ARCH=ON (uses -march=native; do not
+#   distribute that binary).
+# - CMAKE_BUILD_TYPE defaults to Release when not given.
+# - WINDOWS/MSVC: MSVC's default /openmp is OpenMP 2.0 and rejects
+#   '#pragma omp simd' (error C7660 in filters.cpp). The CMakeLists already
+#   compiles with /openmp:experimental on MSVC; keep that if you touch the
+#   OpenMP block. Warnings C4996 (fopen), C4267 and C4244 are harmless.
+# - WINDOWS/PyInstaller: the .pyd links against the vcpkg DLLs (opencv_core4,
+#   opencv_imgcodecs4, opencv_imgproc4, fftw3f, tiff + jpeg62/zlib1/libpng16/
+#   liblzma/libwebp*). vcpkg leaves them next to the binary in build/Release/
+#   and interferolab.spec copies them into the bundle's _internal/. If they
+#   are missing, the frozen app fails with "ImportError: DLL load failed
+#   while importing analysis_backend".
+# - WINDOWS/MSVC runtime: the .pyd also needs MSVCP140.dll and VCOMP140.DLL
+#   (the latter because of /openmp). The spec copies them into _internal/ too
+#   (app-local deployment), so the package is self-contained and target
+#   machines do not need the VC++ Redistributable. During the build
+#   PyInstaller prints "MSVC runtime: <dll> <- <folder>"; if a WARNING shows
+#   up instead, see install/README.md.
+# =========================================================================

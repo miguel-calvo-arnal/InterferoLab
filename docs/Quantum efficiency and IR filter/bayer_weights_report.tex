@@ -1,0 +1,280 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!60!black]{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{listings}
+
+\geometry{margin=2.4cm}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black}\bfseries,
+    commentstyle=\color{gray},
+    frame=single,
+    breaklines=true,
+    columns=fullflexible,
+    language=Python,
+}
+
+\title{\textbf{Bayer superpixel weight derivation}\\
+       \large Thorlabs LP126CU camera under Olympus U-LH100IR illumination}
+\author{InterferoLab}
+\date{May 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\vspace{1em}
+
+% ══════════════════════════════════════════════════════════
+\section{Motivation}
+
+The Thorlabs LP126CU is a color CMOS sensor with a \textbf{Bayer color
+filter array} (CFA) in RGGB pattern\@. Each physical pixel measures only
+one of the three colors, according to its position in the $2\times 2$
+grid:
+
+\begin{center}
+\begin{tabular}{|c|c|}
+\hline
+R & G\textsubscript{1} \\
+\hline
+G\textsubscript{2} & B \\
+\hline
+\end{tabular}
+\end{center}
+
+Coherence scanning interferometry (CSI) works with a \emph{monochrome}
+intensity signal: the gray value of each position $(y,x)$ as a function
+of the axial position $z$. To exploit the signal of all colors without
+resorting to demosaicing (which introduces spurious harmonics, see the
+\emph{Camera characterization report}), each $2\times 2$ block is
+collapsed into a single \textbf{superpixel}:
+\begin{equation}
+  I_{\mathrm{sp}} = w_R\,R + w_{G_1}\,G_1 + w_{G_2}\,G_2 + w_B\,B.
+  \label{eq:superpixel}
+\end{equation}
+The optimal choice of the weights $w_c$ maximizes the signal-to-noise
+ratio (SNR) of the superpixel.
+
+% ══════════════════════════════════════════════════════════
+\section{Optimal weighting criterion}
+
+The CSI interference signal is proportional to the received light
+intensity. For each channel $c \in \{R, G_1, G_2, B\}$, the captured
+signal is:
+\begin{equation}
+  S_c = \int_{\lambda} S_{\mathrm{lamp}}(\lambda)\;
+                       T_{\mathrm{IR}}(\lambda)\;
+                       \mathrm{QE}_c(\lambda)\;d\lambda
+  \label{eq:signal}
+\end{equation}
+where:
+\begin{itemize}[noitemsep]
+  \item $S_{\mathrm{lamp}}(\lambda)$ — emission spectrum of the lamp
+        (spectral power density, a.u.).
+  \item $T_{\mathrm{IR}}(\lambda)$ — transmission of the IR filter built
+        into the camera.
+  \item $\mathrm{QE}_c(\lambda)$ — quantum efficiency of channel $c$
+        (taken from the Thorlabs datasheet, without the IR filter, which
+        is applied separately).
+\end{itemize}
+
+The optimal weight in the maximum-SNR sense is simply proportional to
+the received signal:
+\begin{equation}
+  w_c \propto S_c, \qquad \sum_c w_c = 1.
+  \label{eq:weights}
+\end{equation}
+The RGGB block contains \emph{two} green pixels for every red and blue
+one, so the normalization denominator is $S_R + 2S_G + S_B$, not
+$S_R + S_G + S_B$:
+\begin{equation}
+  w_R = \frac{S_R}{S_R + 2S_G + S_B}, \quad
+  w_{G_1} = w_{G_2} = \frac{S_G}{S_R + 2S_G + S_B}, \quad
+  w_B = \frac{S_B}{S_R + 2S_G + S_B}.
+  \label{eq:normweights}
+\end{equation}
+
+% ══════════════════════════════════════════════════════════
+\section{Spectral model of the lamp}
+
+The lamp in use is an \textbf{Olympus U-LH100IR} (100\,W, 12\,V), a
+tungsten halogen lamp. Halogen lamps operate at higher filament
+temperatures (${\sim}3200$\,K) than conventional incandescent ones
+(${\sim}2800$\,K) thanks to the halogen cycle that regenerates the
+filament.
+
+The emission spectrum is approximated by \textbf{Planck's law} for a
+black body at $T = 3200$\,K:
+\begin{equation}
+  B(\lambda, T) = \frac{2hc^2}{\lambda^5}
+                  \cdot \frac{1}{e^{hc/(\lambda k_B T)} - 1}
+\end{equation}
+Only the spectral shape matters, not the absolute magnitude.
+
+\textbf{Note:} If the measured spectral curve of the U-LH100IR is
+available, $B(\lambda, T)$ should be replaced by that curve for better
+accuracy.
+
+% ══════════════════════════════════════════════════════════
+\section{Input data}
+
+The script \texttt{compute\_bayer\_weights.py} reads four CSV files
+extracted from the plots in the Thorlabs datasheet with the
+WebPlotDigitizer tool:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{File} & \textbf{Contents} \\
+\midrule
+\texttt{ir\_filter\_transmission.csv} & $T_{\mathrm{IR}}(\lambda)$ in \% \\
+\texttt{qe\_red.csv}   & $\mathrm{QE}_R(\lambda)$ in \% \\
+\texttt{qe\_green.csv} & $\mathrm{QE}_G(\lambda)$ in \% \\
+\texttt{qe\_blue.csv}  & $\mathrm{QE}_B(\lambda)$ in \% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All data are interpolated onto a common 400--1000\,nm grid with a 1\,nm
+step. Values outside the measured range are treated as zero (null
+sensor response), which is the correct conservative assumption.
+
+% ══════════════════════════════════════════════════════════
+\section{Computation procedure}
+
+\begin{enumerate}
+  \item \textbf{Load and interpolate} the four curves onto the grid
+        $\lambda \in [400, 1000]$\,nm.
+  \item \textbf{Compute the lamp spectrum} $B(\lambda, 3200)$ from
+        Planck's law.
+  \item \textbf{Compute the integrand} per channel:
+        \begin{equation}
+          f_c(\lambda) = B(\lambda, 3200)\cdot T_{\mathrm{IR}}(\lambda)
+                        \cdot \mathrm{QE}_c(\lambda)
+        \end{equation}
+  \item \textbf{Integrate numerically} with the trapezoidal rule:
+        $S_c = \int f_c(\lambda)\,d\lambda$.
+  \item \textbf{Normalize} according to equation~\eqref{eq:normweights}:
+        denominator $= S_R + 2S_G + S_B$.
+\end{enumerate}
+
+The script also generates a verification figure with three panels:
+(a) the interpolated input curves, (b) the normalized lamp spectrum,
+and (c) the integrands $f_c(\lambda)$ normalized by their own maximum.
+
+% ══════════════════════════════════════════════════════════
+\section{Results}
+
+With $T = 3200$\,K (Olympus U-LH100IR) and the LP126CU curves:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Channel} & \textbf{Weight} & \textbf{Integrated signal (a.u.)} \\
+\midrule
+$w_R$             & 0.257090 & $S_R$ \\
+$w_{G_1}$         & 0.311272 & $S_G$ \\
+$w_{G_2}$         & 0.311272 & $S_G$ \\
+$w_B$             & 0.120366 & $S_B$ \\
+\midrule
+Sum               & 1.000000 & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The green channel receives the largest individual weight because its QE
+is high across the visible range and the halogen lamp emits strongly in
+that region. The blue channel is the weakest: the QE is low ($<$ 20\%)
+in the blue, and the lamp spectrum decays exponentially towards short
+wavelengths.
+
+\subsection{Comparison with 2800\,K}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+$T$ (K) & $w_R$ & $w_{G_1}=w_{G_2}$ & $w_B$ & Change in $w_B$ \\
+\midrule
+2800 & 0.2829 & 0.3073 & 0.1026 & — \\
+3200 & 0.2571 & 0.3113 & 0.1204 & $+17\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The correct temperature (3200\,K vs.\ 2800\,K) increases the blue
+channel's weight by 17\% and reduces the red one's by 9\%. Using
+2800\,K would over-weight red (which carries less real signal from the
+halogen lamp) and under-weight blue.
+
+% ══════════════════════════════════════════════════════════
+\section{Use of the weights in the system}
+
+Since the July 2026 reorganization, the \textbf{single source} of the
+weights on the Python side is the module
+\texttt{utils/camera\_constants.py}. It is consumed by:
+
+\begin{enumerate}
+  \item \textbf{Acquisition} (\texttt{backend/acquisition/acquisition\_controller.py}):
+        the function \texttt{\_bayer\_to\_superpixel()}, which combines
+        the four sub-pixels of the raw Bayer block in real time during
+        acquisition.
+
+  \item \textbf{Offline processing} (\texttt{scripts/process\_superpixel.py}):
+        conversion of already-acquired datasets to the superpixel format.
+
+  \item \textbf{GUI}: the default values of the weight spinboxes in the
+        processing panel.
+\end{enumerate}
+
+The \textbf{C++ analysis} keeps a copy of these values in
+\texttt{backend/analysis/include/config.hpp} (constants
+\texttt{GRAY\_WEIGHT\_R/G/B}), which must be kept \emph{synchronized by
+hand} with \texttt{utils/camera\_constants.py} on recalibration (a
+regression test detects divergence). In that context the images are
+already demosaiced and the G channel represents the mean of $G_1$ and
+$G_2$, so its weight is doubled:
+\begin{equation}
+  W_G^{\mathrm{RGB}} = w_{G_1} + w_{G_2} = 0.622544.
+\end{equation}
+
+% ══════════════════════════════════════════════════════════
+\section{Limitations and possible improvements}
+
+\begin{itemize}
+  \item \textbf{Curves extracted from plots}: the CSVs come from
+        WebPlotDigitizer applied to the datasheet plots, not from
+        tabulated data. The digitization error is estimated at
+        $\pm 1$--$2\%$ per channel.
+
+  \item \textbf{Lamp spectrum}: a black body at 3200\,K is used as an
+        approximation. The real color temperature of the U-LH100IR can
+        vary slightly with the supply voltage. A measured spectral
+        curve would improve accuracy.
+
+  \item \textbf{Optical-path transmission}: the model does not include
+        the spectral transmission of the interferometric objective, the
+        beam splitter, or the condenser of the Olympus microscope.
+        These elements can shift the optimal weights non-negligibly
+        (the experimental coherence length suggests a spectral
+        narrowing of a factor ${\sim}2$ with respect to the
+        camera-only model).
+\end{itemize}
+
+\end{document}

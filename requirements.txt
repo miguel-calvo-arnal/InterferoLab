@@ -1,0 +1,37 @@
+# Versions PINNED to the verified set (2026-08-26, re-verified 2026-08-27 on
+# Python 3.13 and 3.14): with this exact set the whole suite passes (307
+# tests). They were pinned after finding that the previous open ranges
+# (PySide6>=6.6, ...) silently pulled new versions: the jump from PySide6
+# 6.11.0 to 6.11.2 uncovered a lifecycle bug in HeightmapView.
+#
+# To bump a dependency: change its pin, recreate the venv (see README,
+# Getting started) and run the suite BEFORE committing.
+#
+# numba/llvmlite arrive as transitive dependencies of pylablib, which
+# declares them with NO version bound — so they are pinned here explicitly
+# (the spec also handles libllvmlite specially when stripping). The old
+# advice to preinstall numba by hand only worked around uv's resolver with
+# the open ranges, and is obsolete.
+
+PySide6==6.11.2
+numba==0.67.0
+llvmlite==0.49.0
+pyqtgraph==0.14.0
+numpy==2.5.2
+scipy==1.18.1
+opencv-python-headless==5.0.0.93
+pylablib==1.4.5
+pipython==2.13.0.2
+pyinstaller==6.22.2
+pybind11==3.1.0
+
+# Optional, but useful for debugging and packaging
+#importlib-metadata; python_version>="3.10"
+
+# Tests (tests/ folder, run with: python -m pytest):
+pytest==9.1.1
+pytest-qt==4.5.0
+
+# Analysis scripts (scripts/ and the camera-report tooling):
+matplotlib==3.11.1
+tifffile==2026.8.23

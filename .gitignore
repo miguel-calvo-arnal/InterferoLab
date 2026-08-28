@@ -1,0 +1,47 @@
+# Python environments and caches
+.venv/
+.venv-win/
+__pycache__/
+*.pyc
+
+# Regenerable artifacts and large data (kept on disk, out of the repo)
+output/
+logs/
+data/
+dist/
+build/
+build-linux/
+releases/
+*.spec.bak
+
+# install/: only its README travels (deployment payloads stay on local disk)
+install/*
+!install/README.md
+
+# docs/ stays out of git except the Bayer-weights source (cited from code)
+docs/*
+!docs/Quantum efficiency and IR filter/
+
+# auditoria/: local historical records of the July 2026 audit (summarized in CHANGELOG.md)
+auditoria/
+
+# resultados/: local noise-analysis results (heavy PDFs), out of the public repo
+resultados/
+
+# Compiled backend binaries: distributed via releases/, not git
+backend/analysis/*.so
+backend/analysis/*.pyd
+
+# Proprietary Physik Instrumente SDK (not redistributable); see API/README.md
+API/*
+!API/README.md
+
+# Runtime residue (the app regenerates it) and personal project management
+app_config.json
+app_config.json.bak
+HANDOFF.md
+LOG.md
+
+# Thorlabs datasheet figures (copyrighted; digitization inputs kept local only)
+docs/Quantum efficiency and IR filter/quantum efficiency.png
+docs/Quantum efficiency and IR filter/IR filter transmission.png

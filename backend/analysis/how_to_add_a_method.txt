@@ -1,0 +1,35 @@
+The process is exactly 4 steps, and methods.hpp documents them:
+
+---
+
+1. Choose a free ID (e.g. 3) and add a row to RECONSTRUCTION_METHODS[] in
+backend/analysis/include/methods.hpp:
+
+{
+    3,
+    "My new method",
+    "One-line description for the tooltip.",
+    /*needs_baseline_removal=*/ true,   // does it require DC baseline removal?
+    /*needs_global_params=*/   false,   // does it require global pre-computation in the first chunk?
+},
+
+2. Implement the envelope logic in backend/analysis/src/reconstruction.cpp, function compute_envelope():
+
+case 3:
+    // your pixel-by-pixel logic here
+    // input:  signal[] (already DC-removed if needs_baseline_removal=true)
+    // output: envelope[]
+    break;
+
+If needs_global_params = true, also add a case 3: in the estimate_global_params() block in the same file.
+
+3. Recompile. The method will automatically appear in the processing panel dropdown — the Python UI discovers it via
+analysis_backend.get_reconstruction_methods(), which iterates over RECONSTRUCTION_METHODS[] in C++.
+
+4. Update app_config.json if you want this method to be the default at startup:
+
+"method_id": 3
+
+---
+
+No Python files need to be modified. The only non-trivial location is reconstruction.cpp, where the actual processing signal logic lives.
