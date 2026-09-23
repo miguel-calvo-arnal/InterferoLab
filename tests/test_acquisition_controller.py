@@ -17,9 +17,11 @@ from helpers_acquisition import (
     reference_superpixel,
     reference_superpixel_binned,
 )
+from pipython import GCSError
 
 from backend.acquisition.acquisition_controller import AcquisitionSession, CancelFlag
 from utils import bin12
+from utils.camera_constants import BAYER_W_B, BAYER_W_R
 
 
 @pytest.fixture
@@ -472,6 +474,81 @@ def test_run_sweep_counts_skipped_frames_and_completes(session, tmp_path):
     assert session.last_sweep_total_frames == 5
     assert log.contains("Incomplete dataset: 2 of 5", level="warn")
     assert log.contains("Sweep finished", level="info")
+    assert session.last_sweep_aborted is None  # isolated failures never abort
+    assert AcquisitionSession.ABORT_MARKER not in _output_files(folder)
+
+
+def test_run_sweep_aborts_after_consecutive_capture_failures(session, tmp_path):
+    """Batch 2 (C4): three failed captures in a row stop the sweep instead of
+    walking every remaining position; the partial folder is marked."""
+    # 10 positions; frames 0-1 good, the camera dies from frame 2 on
+    _, piezo = _attach(session, camera=FakeCamera(fail_snap_at=tuple(range(2, 100))))
+    log = LogCollector()
+    folder = session.run_sweep(_base_cfg(tmp_path, end=9.0), log_cb=log)
+
+    assert session.last_sweep_total_frames == 10
+    assert session._camera.snap_count == 2 + AcquisitionSession.SWEEP_MAX_CONSECUTIVE_FAILURES
+    assert len(piezo.moves) == 5  # no MOV after the third failure
+    assert session.last_sweep_skipped_frames == 8  # 3 failed + 5 never attempted
+    summary = session.last_sweep_aborted
+    assert "3 consecutive camera failures" in summary
+    assert "2 of 10 frame(s) saved" in summary and folder in summary
+    assert log.contains("Sweep aborted after 3 consecutive", level="error")
+    assert not log.contains("Sweep finished")
+    assert all(m.strip() for m in log.messages("error"))
+
+    files = _output_files(folder)
+    assert AcquisitionSession.ABORT_MARKER in files
+    assert len([f for f in files if f.endswith(".tiff")]) == 2
+    with open(os.path.join(folder, AcquisitionSession.ABORT_MARKER), encoding="utf-8") as fh:
+        marker = fh.read()
+    assert "INCOMPLETE DATASET" in marker
+    assert "frames_saved = 2" in marker and "frames_planned = 10" in marker
+
+
+def test_run_sweep_aborts_after_consecutive_save_failures(session, tmp_path, monkeypatch):
+    """Review H4: a full disk (every save fails) aborts after 3, like the camera."""
+    import backend.acquisition.acquisition_controller as ac
+
+    monkeypatch.setattr(ac.cv2, "imwrite", lambda *a, **k: False)
+    _, piezo = _attach(session)
+    log = LogCollector()
+    folder = session.run_sweep(_base_cfg(tmp_path, end=9.0), log_cb=log)
+    assert session._camera.snap_count == AcquisitionSession.SWEEP_MAX_CONSECUTIVE_FAILURES
+    assert len(piezo.moves) == 3
+    assert "3 consecutive save failures" in session.last_sweep_aborted
+    assert "0 of 10 frame(s) saved" in session.last_sweep_aborted
+    assert AcquisitionSession.ABORT_MARKER in _output_files(folder)
+
+
+def test_run_sweep_failure_streak_is_reset_by_a_good_frame(session, tmp_path):
+    """Two failures, a good frame, two failures: never three in a row, no abort."""
+    _attach(session, camera=FakeCamera(fail_snap_at=(0, 1, 3, 4)))
+    folder = session.run_sweep(_base_cfg(tmp_path, end=5.0))
+    assert session.last_sweep_aborted is None
+    assert session.last_sweep_skipped_frames == 4
+    assert len(_output_files(folder)) == 2
+
+
+def test_run_sweep_timeout_without_message_is_logged_with_text(session, tmp_path):
+    """pylablib's snap timeout has an empty message (C7): the log must say what it was."""
+    from helpers_acquisition import FakeCameraTimeoutError
+
+    cam = FakeCamera()
+    orig = cam.snap
+
+    def snap(timeout=None):
+        if cam.snap_count == 1:
+            cam.snap_count += 1
+            raise FakeCameraTimeoutError()
+        return orig(timeout)
+
+    cam.snap = snap
+    _attach(session, camera=cam)
+    log = LogCollector()
+    session.run_sweep(_base_cfg(tmp_path), log_cb=log)
+    errs = [m for m in log.messages("error") if "Camera timeout/error" in m]
+    assert len(errs) == 1 and "did not deliver a frame in time" in errs[0]
 
 
 def test_run_sweep_cancel_mid_sweep_stops_cleanly(session, tmp_path):
@@ -551,14 +628,59 @@ def test_wait_on_target_timeout_raises(session, fast_poll):
 
 
 def test_wait_on_target_falls_back_when_qont_unavailable(session, fast_poll):
-    """A failing qONT falls back to a settle-time wait and returns True."""
+    """A controller WITHOUT qONT (GCS 2, unknown command) falls back to a
+    settle-time wait and returns True."""
 
     class NoOntPiezo(FakePiezo):
         def qONT(self, axis):  # noqa: N802
-            raise RuntimeError("qONT not supported")
+            raise GCSError(AcquisitionSession.GCS_UNKNOWN_COMMAND)
 
     session._settle_time = 0.01
     assert session._wait_on_target(NoOntPiezo(), timeout_s=5.0) is True
+
+
+@pytest.mark.parametrize("error", [GCSError(-7), RuntimeError("link down")])
+def test_wait_on_target_raises_when_arrival_cannot_be_confirmed(session, fast_poll, error):
+    """Batch 2 (C11): a qONT that keeps failing is a failed move, not an arrival."""
+
+    class BrokenOntPiezo(FakePiezo):
+        def qONT(self, axis):  # noqa: N802
+            self._polls += 1
+            raise error
+
+    piezo = BrokenOntPiezo()
+    with pytest.raises(RuntimeError, match="Could not confirm that the piezo reached"):
+        session._wait_on_target(piezo, timeout_s=5.0)
+    assert piezo._polls == AcquisitionSession.QONT_MAX_CONSECUTIVE_FAILURES
+
+
+def test_wait_on_target_tolerates_a_transient_qont_error(session, fast_poll):
+    """One transient comms error (e.g. GCS -7) is polled again, not fatal."""
+
+    class FlakyOntPiezo(FakePiezo):
+        def qONT(self, axis):  # noqa: N802
+            self._polls += 1
+            if self._polls == 1:
+                raise GCSError(-7)
+            return {axis: True}
+
+    piezo = FlakyOntPiezo()
+    assert session._wait_on_target(piezo, timeout_s=5.0) is True
+    assert piezo._polls == 2
+
+
+def test_move_to_fails_when_arrival_cannot_be_confirmed(session, fast_poll):
+    """The manual-move path surfaces C11 as an error (the UI shows it)."""
+
+    class BrokenOntPiezo(FakePiezo):
+        def qONT(self, axis):  # noqa: N802
+            raise GCSError(-3)
+
+    _attach(session, piezo=BrokenOntPiezo())
+    log = LogCollector()
+    with pytest.raises(RuntimeError, match="Could not confirm"):
+        session.move_to(10.0, log_cb=log)
+    assert log.contains("Closed-loop move to 10.0000 failed", level="error")
 
 
 # ---------------------------------------------------------------------------
@@ -604,3 +726,180 @@ def test_disconnect_all_is_idempotent(session):
     assert session._camera is None and session._piezo is None
     assert session.disconnect_all() is True  # nothing left to release
     assert cam.closed is True and piezo.closed is True
+
+
+# ---------------------------------------------------------------------------
+# Bayer mosaic phase (the LP126CU is BGGR, not RGGB)
+# ---------------------------------------------------------------------------
+def test_color_superpixel_bggr_swaps_red_and_blue():
+    """With phase "blue" the corners are read as B,G,G,R instead of R,G,G,B."""
+    frame = np.array([[100, 200], [300, 400]], dtype=np.uint16)
+    out = AcquisitionSession._bayer_to_color_superpixel(frame, "blue")
+    # (0,0) is blue and (1,1) is red, so the RGB triple is mirrored.
+    assert tuple(out[0, 0]) == (400, 250, 100)
+
+
+def test_color_superpixel_phase_only_permutes_channels():
+    """Changing the phase reorders channels; it never invents or drops data."""
+    frame = make_rggb_frame(8, 8, seed=11)
+    rggb = AcquisitionSession._bayer_to_color_superpixel(frame, "red")
+    bggr = AcquisitionSession._bayer_to_color_superpixel(frame, "blue")
+    np.testing.assert_array_equal(bggr[:, :, 0], rggb[:, :, 2])
+    np.testing.assert_array_equal(bggr[:, :, 2], rggb[:, :, 0])
+    np.testing.assert_array_equal(bggr[:, :, 1], rggb[:, :, 1])
+
+
+def test_mono_superpixel_bggr_applies_red_weight_to_the_real_red():
+    """Under BGGR the red weight goes to (1,1); the greens are unaffected."""
+    frame = np.array([[1000, 0], [0, 0]], dtype=np.uint16)  # only (0,0) lit
+    rggb = AcquisitionSession._bayer_to_superpixel(frame, "red")
+    bggr = AcquisitionSession._bayer_to_superpixel(frame, "blue")
+    # (0,0) is red under RGGB and blue under BGGR: W_R vs W_B.
+    assert rggb[0, 0] == round(1000 * BAYER_W_R)
+    assert bggr[0, 0] == round(1000 * BAYER_W_B)
+
+
+def test_mono_superpixel_default_phase_is_bit_exact_with_rggb():
+    """Omitting the phase keeps the historical RGGB result bit-for-bit."""
+    frame = make_rggb_frame(12, 10, seed=5)
+    np.testing.assert_array_equal(
+        AcquisitionSession._bayer_to_superpixel(frame),
+        AcquisitionSession._bayer_to_superpixel(frame, "red"),
+    )
+
+
+def test_superpixel_binned_forwards_the_phase():
+    """mono_superpixel binning uses the phase instead of always assuming RGGB."""
+    frame = make_rggb_frame(8, 8, seed=7)
+    assert not np.array_equal(
+        AcquisitionSession._bayer_to_superpixel_binned(frame, "red"),
+        AcquisitionSession._bayer_to_superpixel_binned(frame, "blue"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Measured position (batch 3: C3, U3, U4)
+# ---------------------------------------------------------------------------
+def test_move_returns_and_reports_the_measured_position(session, fast_poll):
+    """The position is qPOS, not the target (U4); healthy moves read it once."""
+    _, piezo = _attach(session)
+    piezo.position = 12.3456
+    seen: list[float] = []
+    assert session.move_to(12.3, position_cb=seen.append) == 12.3456
+    assert seen == [12.3456]
+    assert session.last_position == 12.3456
+    assert piezo.qpos_calls == 1  # no qPOS on the first poll: nothing extra
+
+
+@pytest.mark.parametrize("polls_needed, expected_qpos", [(0, 1), (1, 1), (3, 3)])
+def test_live_position_costs_one_query_per_poll_after_the_first(
+    session, fast_poll, polls_needed, expected_qpos
+):
+    _, piezo = _attach(session, piezo=FakePiezo(ont_polls_needed=polls_needed))
+    seen: list[float] = []
+    session.move_to(5.0, position_cb=seen.append)
+    assert piezo.qpos_calls == expected_qpos
+    assert len(seen) == expected_qpos  # every reading reaches the window
+
+
+def test_failed_move_reports_where_the_stage_is(session, fast_poll):
+    """C3: the MOV ran but the arrival never came: the stage position is read
+    and reported (live during the wait, and at the end), then the error."""
+    _, piezo = _attach(session, piezo=FakePiezo(ont_polls_needed=10**9))
+    session.MOVE_TIMEOUT_S = 0.05
+    piezo.position = 59.998
+    seen: list[float] = []
+    with pytest.raises(TimeoutError):
+        session.move_to(60.0, position_cb=seen.append)
+    assert session.last_position == 59.998
+    assert seen and seen[-1] == 59.998 and len(seen) >= 2
+
+
+def test_cancelled_move_reports_the_measured_position_not_the_target(session, fast_poll):
+    _, piezo = _attach(session, piezo=FakePiezo(ont_polls_needed=10**9))
+    flag = CancelFlag()
+    piezo.qont_hook = lambda p: flag.cancel() if p._polls >= 1 else None
+    piezo.position = 31.7
+    assert session.move_to(40.0, cancel_flag=flag) == 31.7
+    assert session.last_position == 31.7
+
+
+def test_rejected_mov_reports_the_old_position(session, fast_poll):
+    _, piezo = _attach(session)
+    session.move_to(10.0)
+    piezo.mov_error = GCSError(7)
+    seen: list[float] = []
+    with pytest.raises(GCSError):
+        session.move_to(90.0, position_cb=seen.append)
+    assert seen == [10.0] and session.last_position == 10.0
+
+
+def test_unreadable_position_is_unknown_not_the_target(session, fast_poll):
+    _, piezo = _attach(session)
+    piezo.position = GCSError(-3)
+    log = LogCollector()
+    seen: list[float] = []
+    z = session.move_to(20.0, log_cb=log, position_cb=seen.append)
+    assert np.isnan(z) and np.isnan(seen[-1]) and np.isnan(session.last_position)
+    assert log.contains("Could not read the piezo position", level="warn")
+
+
+def test_sweep_names_files_by_target_and_reports_measured_z(session, tmp_path):
+    """Filenames keep the commanded z (the analysis reads it); progress and
+    the position indicator get the measured one."""
+    _, piezo = _attach(session)
+    piezo.position = 1.0123
+    progress: list[float] = []
+    folder = session.run_sweep(
+        _base_cfg(tmp_path, end=1.0),
+        progress_cb=lambda pct, z, *a: progress.append(z),
+    )
+    assert _output_files(folder) == ["piezo_0.0000um_0000.tiff", "piezo_1.0000um_0001.tiff"]
+    assert progress == [1.0123, 1.0123]
+
+
+def test_connect_piezo_reads_the_starting_position(session, monkeypatch):
+    import backend.acquisition.acquisition_controller as ac
+
+    class FakeDevice(FakePiezo):
+        def __init__(self, devname=None, gcsdll=None):
+            super().__init__()
+            self.position = 47.25
+
+        def ConnectUSB(self, serialnum):  # noqa: N802
+            pass
+
+        def qIDN(self):  # noqa: N802
+            return "fake"
+
+        def qERR(self):  # noqa: N802
+            return 0
+
+    monkeypatch.setattr(ac, "GCSDevice", FakeDevice)
+    assert session.connect_piezo("123", "dll") is True
+    assert session.last_position == 47.25
+
+
+# ---------------------------------------------------------------------------
+# disconnect_all (batch 4)
+# ---------------------------------------------------------------------------
+def test_disconnect_park_timeout_still_switches_the_servo_off(session, fast_poll):
+    """A piezo that never reports reaching 0: warned, servo off, link closed."""
+    _, piezo = _attach(session, piezo=FakePiezo(ont_polls_needed=10**9))
+    session._closed_loop = True
+    log = LogCollector()
+    assert session.disconnect_all(log_cb=log, park_timeout_s=0.05) is True
+    assert piezo.moves[-1] == ("A", 0.0)
+    assert piezo.svo_calls == [("A", 0)] and piezo.closed
+    assert log.contains("did not report reaching 0 within", level="warn")
+    assert not log.contains("Could not reset piezo")
+
+
+def test_disconnect_cancel_flag_cuts_the_park_wait(session, fast_poll):
+    _, piezo = _attach(session, piezo=FakePiezo(ont_polls_needed=10**9))
+    session._closed_loop = True
+    flag = CancelFlag()
+    flag.cancel()
+    session.disconnect_all(park_timeout_s=30.0, cancel_flag=flag)
+    assert piezo._polls == 0  # the wait ended before its first poll
+    assert piezo.svo_calls == [("A", 0)] and piezo.closed

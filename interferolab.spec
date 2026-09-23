@@ -291,6 +291,9 @@ excludes = [
 	"jupyter",
 	"pytest",
 	"setuptools",
+
+	# --- hardware simulator: NEVER ships (see the guard after Analysis) ---
+	"sim",
 ]
 
 # ----------------------------------------------------------
@@ -311,6 +314,31 @@ a = Analysis(
 	noarchive=False,
 	cipher=block_cipher,
 )
+
+# >>> sim-exclusion guard
+# The hardware simulator (sim/: fake pylablib/pipython + launcher) must never
+# end up in a release: a frozen app with fake drivers would "work" without
+# ever touching the instrument. "sim" is in `excludes` above; this guard
+# aborts the build if anything from sim/ (by module name or by source path,
+# which also catches the fake pylablib/pipython packages) got in anyway.
+# tests/test_sim_safeguards.py executes this block against fake TOCs.
+_sim_root = os.path.normcase(os.path.join(os.path.abspath(project_root), "sim")) + os.sep
+
+def _is_sim_entry(entry):
+	name = str(entry[0]).replace("\\", "/")
+	src = str(entry[1]) if len(entry) > 1 and entry[1] else ""
+	if name == "sim" or name.startswith("sim.") or name.startswith("sim/"):
+		return True
+	return bool(src) and os.path.normcase(os.path.abspath(src)).startswith(_sim_root)
+
+_sim_hits = [e[0] for toc in (a.pure, a.binaries, a.datas) for e in toc if _is_sim_entry(e)]
+if _sim_hits:
+	raise SystemExit(
+		"ERROR: the hardware simulator (sim/) would be bundled: %s\n"
+		"sim/ must never ship; it is only run through sim/run_simulated.py."
+		% ", ".join(sorted(set(map(str, _sim_hits)))[:20])
+	)
+# <<< sim-exclusion guard
 
 # ----------------------------------------------------------
 # Post-Analysis safety-net filter

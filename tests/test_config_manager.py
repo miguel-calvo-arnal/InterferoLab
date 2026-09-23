@@ -131,6 +131,21 @@ def test_color_mode_accepts_mono_superpixel(cfg_dir):
     assert config_manager.load_config() == {"acq": {"color_mode": "mono_superpixel"}}
 
 
+def test_keyboard_step_um_accepted_in_range_rejected_outside(cfg_dir, caplog):
+    """Batch 5 (U8): the fine keyboard step is validated like the other
+    small µm quantities (e.g. 'step')."""
+    raw = {"acq": {"keyboard_step_um": 0.02}}
+    _cfg_path(cfg_dir).write_text(json.dumps(raw), encoding="utf-8")
+    assert config_manager.load_config() == raw
+
+    raw_bad = {"acq": {"keyboard_step_um": 50.0}}  # above the 5.0 um max
+    _cfg_path(cfg_dir).write_text(json.dumps(raw_bad), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="utils.config_manager"):
+        cfg = config_manager.load_config()
+    assert cfg == {"acq": {}}
+    assert "acq.keyboard_step_um" in caplog.text
+
+
 def test_color_mode_choices_match_panel_combo(cfg_dir):
     """Schema choices and the AcquisitionPanel combo stay in sync (single source drift guard)."""
     from views.AcquisitionPanel import CHANNEL_MODES

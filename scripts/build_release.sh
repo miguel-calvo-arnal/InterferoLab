@@ -110,6 +110,41 @@ cd "$ROOT"
 rm -f  "$ROOT/dist/$NAME/app_config.json"
 rm -rf "$ROOT/dist/$NAME/logs"
 
+# >>> sim-exclusion check
+# The hardware simulator (sim/, with FAKE pylablib/pipython) must never ship.
+# interferolab.spec already excludes it and aborts if it slips in; this
+# second gate inspects the finished bundle (files AND the embedded PYZ).
+"$PY" - "$ROOT/dist/$NAME" "$ROOT/dist/$NAME/$NAME" <<'PYSIM' || die "the bundle contains the hardware simulator (sim/); refusing to package"
+import os, sys
+from PyInstaller.archive.readers import CArchiveReader, PKG_ITEM_PYZ
+dist, exe = sys.argv[1], sys.argv[2]
+bad = []
+for dirpath, dirnames, filenames in os.walk(dist):
+    rel = os.path.relpath(dirpath, dist).replace(os.sep, "/")
+    if "sim" in rel.split("/"):
+        bad.append(rel + "/")
+    bad += [os.path.join(rel, f) for f in filenames
+            if f in ("run_simulated.py", "lab_timing_probe.py", "hwprofile.py")]
+arch = CArchiveReader(exe)
+for name, entry in arch.toc.items():
+    if entry[-1] != PKG_ITEM_PYZ:
+        continue
+    pyz = arch.open_embedded_archive(name)
+    for mod in pyz.toc:
+        if mod == "sim" or mod.startswith("sim."):
+            bad.append("PYZ:" + mod)
+        elif mod.split(".")[0] in ("pylablib", "pipython"):
+            code = pyz.extract(mod)
+            doc = code.co_consts[0] if code.co_consts and isinstance(code.co_consts[0], str) else ""
+            if "__simulated__" in code.co_names or doc.lstrip().startswith("[SIMULATION]"):
+                bad.append("PYZ:" + mod + " (FAKE driver)")
+if bad:
+    print("  simulator content in the bundle:", *bad[:20], sep="\n    ")
+    sys.exit(1)
+print("  OK - no simulator module or fake driver in the bundle")
+PYSIM
+# <<< sim-exclusion check
+
 # ---------------------------------------------------------------------
 step "5/5  Creating the archive in releases/"
 # ---------------------------------------------------------------------

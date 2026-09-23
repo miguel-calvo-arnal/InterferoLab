@@ -1,0 +1,25 @@
+# =====================================================================
+# Sensitivity profile for sim/perf_preview.py: every ESTIMATED SDK/USB
+# duration of default.toml at HALF its value.  Published and derived
+# figures (readout 1/21.7 fps, settling 25 ms) are NOT changed, and neither
+# are pylablib's fixed sleeps (library code).  Merged over default.toml.
+#   python sim/perf_preview.py --profile sim/profiles/perf_sdk_half.toml
+# =====================================================================
+
+[meta]
+name = "perf_sdk_half"
+description = "Sensitivity: estimated SDK and GCS durations x 0.5 (2026-09-21)."
+
+[camera.timing]
+open_s            = { value = 0.4,    origin = "estimated", source = "Sensitivity: default.toml open_s x 0.5" }
+close_s           = { value = 0.05,   origin = "estimated", source = "Sensitivity: default.toml close_s x 0.5" }
+sdk_call_s        = { value = 0.0005, origin = "estimated", source = "Sensitivity: default.toml sdk_call_s x 0.5" }
+arm_s             = { value = 0.075,  origin = "estimated", source = "Sensitivity: default.toml arm_s x 0.5" }
+disarm_s          = { value = 0.025,  origin = "estimated", source = "Sensitivity: default.toml disarm_s x 0.5" }
+trigger_latency_s = { value = 0.0005, origin = "estimated", source = "Sensitivity: default.toml trigger_latency_s x 0.5" }
+
+[piezo.timing]
+connect_s   = { value = 0.15,  origin = "estimated", source = "Sensitivity: default.toml connect_s x 0.5" }
+close_s     = { value = 0.025, origin = "estimated", source = "Sensitivity: default.toml close_s x 0.5" }
+gcs_write_s = { value = 0.001, origin = "estimated", source = "Sensitivity: default.toml gcs_write_s x 0.5" }
+gcs_query_s = { value = 0.005, origin = "estimated", source = "Sensitivity: default.toml gcs_query_s x 0.5" }

@@ -1,0 +1,156 @@
+# =====================================================================
+# InterferoLab hardware simulator - default profile
+#
+# Every hardware FIGURE is an inline table with three keys:
+#   value  : the number (or string) the simulator uses
+#   origin : one of  published | measured | derived | estimated
+#   source : where it comes from (link, file:line, the calculation, or
+#            WHY it was estimated)
+# Plain keys (no table) are SETTINGS of the simulator, not hardware facts.
+#
+# A lab-measured profile (written by sim/lab_timing_probe.py) only needs
+# the figures it measured: sim/profile.py merges it over this file.
+#   python sim/run_simulated.py --profile sim/profiles/measured_YYYY-MM-DD.toml
+#
+# The fixed sleeps inside pylablib 1.4.5 (0.05 s before the software
+# trigger, 0.2 s before every disarm) and the 85-frame ring buffer are
+# NOT figures: they are library code, reproduced verbatim by the fake
+# (sim/fakes/pylablib/devices/Thorlabs/TLCamera.py).
+# Reference for the facts: _agentes/_trabajo/1_hechos.md (Spanish).
+# =====================================================================
+
+[meta]
+name = "default"
+description = "Published and estimated figures, 2026-09-21. No lab-measured timing yet."
+
+# ---------------------------------------------------------------------
+# Camera: Thorlabs LP126CU
+# ---------------------------------------------------------------------
+[camera]
+model = "LP126CU [SIMULATION]"
+serial = "SIM-LP126CU-00000"
+# Synthesise EVERY frame delivered while the camera stays armed, each one at
+# the stage position of its own mid-exposure (true, since 2026-09-22: with the
+# camera armed once, the preview must follow the piezo and fresh noise per
+# frame).  false re-uses the first frame after the trigger (plus a real
+# 24.6 MB copy per frame, like the SDK callback in pylablib does): cheaper,
+# but the image freezes for as long as the camera stays armed.
+regenerate_every_frame = true
+# Every frame delivered while armed is recorded in ThorlabsTLCamera.frame_log
+# (index, times, z at mid-exposure, exposure); thumbnails are only computed
+# when a tool asks for them (perf gate).
+
+[camera.timing]
+open_s              = { value = 0.8,    origin = "estimated", source = "Not published (1_hechos s.5 gap). list_cameras + tl_camera_open_camera + callback registration; guessed below the ~1 s pylablib quotes for slow cameras." }
+close_s             = { value = 0.1,    origin = "estimated", source = "Not published. Guess." }
+sdk_call_s          = { value = 0.001,  origin = "estimated", source = "One getter/setter round trip to the camera over USB (exposure, ROI, info). Not published; guess." }
+arm_s               = { value = 0.15,   origin = "estimated", source = "tl_camera_arm with an 85-frame (~2.1 GB) buffer: not published (1_hechos s.5 gap). pylablib docs: start/stop 'for some cameras can take about a second' (https://github.com/AlexShkarin/pyLabLib/blob/main/docs/devices/cameras_basics.rst). MOST UNCERTAIN FIGURE: measure it." }
+disarm_s            = { value = 0.05,   origin = "estimated", source = "tl_camera_disarm: not published. Guess." }
+trigger_latency_s   = { value = 0.001,  origin = "estimated", source = "Software trigger over USB until exposure starts: not published (hardware trigger is 75 ns, manual p.19, not applicable)." }
+readout_transfer_s  = { value = 0.0461, origin = "derived",   source = "1 / 21.7 fps at full sensor (published, https://www.manualslib.com/manual/3305883/Thorlabs-Lp126mu.html?page=24): upper bound of readout + USB transfer of one 24.6 MB frame." }
+min_frame_period_s  = { value = 0.0461, origin = "derived",   source = "1 / 21.7 fps (same page 24)." }
+
+[camera.sensor]
+width               = { value = 4096,    origin = "published", source = "https://www.manualslib.com/manual/3305883/Thorlabs-Lp126mu.html?page=23" }
+height              = { value = 3000,    origin = "published", source = "same page 23" }
+bit_depth           = { value = 12,      origin = "published", source = "https://www.manualslib.com/manual/3305883/Thorlabs-Lp126mu.html?page=24" }
+full_well_e         = { value = 10650.0, origin = "published", source = ">= 10 650 e-, page 23" }
+read_noise_e        = { value = 2.5,     origin = "published", source = "< 2.5 e- RMS, page 24 (upper bound used)" }
+gain_e_per_dn       = { value = 2.6,     origin = "derived",   source = "10650 e- / 4095 DN = 2.60, assuming full well maps to ADC full scale at the default gain (gain never set by the app)." }
+black_level_dn      = { value = 0.0,     origin = "estimated", source = "Not published for raw. docs/Informe camara: G ~ 0.4 DN under red light on ThorCam-debayered frames suggests an offset near 0." }
+dark_current_e_per_s = { value = 0.0,    origin = "estimated", source = "Not published by Thorlabs; negligible at ms exposures." }
+exposure_min_s      = { value = 2.8e-5,  origin = "published", source = "0.028 ms, page 24" }
+exposure_max_s      = { value = 14.7009, origin = "published", source = "14700.9 ms, page 24" }
+filter_array_phase  = { value = "blue",  origin = "measured",  source = "Lab log 2026-09-08 via HANDOFF.md 2026-09-09 (log no longer on disk): BGGR." }
+
+# ---------------------------------------------------------------------
+# Signal layer: white-light interferogram
+#   I_c(z) = L_c * illum * (1 + V_c * exp(-4 ln2 (d/FWHM_c)^2) * cos(2 pi d / P_c))
+#   with d = z_stage - h(x, y): a pixel is in focus when the piezo is at h.
+# ---------------------------------------------------------------------
+[signal]
+# "synthetic" (known surface) or "replay" (real stack, see [replay])
+mode = "synthetic"
+seed = 12345
+# LUT resolution along d; heights are quantised to this step
+lut_step_um = 0.001
+# Row bands generated in parallel threads (0 = automatic, up to 8; 1 = serial).
+# The frame is identical either way; only the cost per frame changes.
+generate_threads = 0
+
+reference_exposure_s = { value = 0.007, origin = "estimated", source = "Assumes the 2026-03-13 LP126CU stack was taken at the app default (7 ms, AcquisitionPanel.py:152); its real exposure is not recorded." }
+level_g_dn    = { value = 430.0, origin = "measured",  source = "Median background of the G channel of the LP126CU stacks (pylablib-debayered), 960-pixel grids; 2026-09-21. Clean stacks give 417-423 (_agentes/_trabajo/3_verificacion.md s.3)." }
+level_ratio_r = { value = 0.826, origin = "derived",   source = "BAYER_W_R / BAYER_W_G1 = 0.257090 / 0.311272 (QE x IR filter x 3200 K blackbody, utils/camera_constants.py)." }
+level_ratio_b = { value = 0.387, origin = "derived",   source = "BAYER_W_B / BAYER_W_G1 = 0.120366 / 0.311272." }
+visibility_r  = { value = 0.55,  origin = "estimated", source = "Between S1F1 (0.36, other camera) and the LP126CU stack (~1, inflated by pylablib's colour-correction matrix). Raw visibility unknown." }
+visibility_g  = { value = 0.55,  origin = "estimated", source = "Same reasoning (S1F1 0.34, LP126CU stack 0.84)." }
+visibility_b  = { value = 0.55,  origin = "estimated", source = "Same reasoning (S1F1 0.6)." }
+period_r_um   = { value = 0.325, origin = "measured",  source = "Fringe period in z (phase slope of the analytic signal), R channel, clean LP126CU stacks 2026-03-13_13-14-36 (0.322) and 2026-04-22_12-41-58 (0.328), 960 pixels each; sim/compare_real_vs_sim.py, _agentes/_trabajo/3_verificacion.md s.3." }
+period_g_um   = { value = 0.2865, origin = "measured", source = "Same method and stacks, G channel: 0.283 and 0.290 (_agentes/_trabajo/3_verificacion.md s.3). Consistent with the QE x IR x 3200 K prediction (0.277) lengthened by the objective NA (~0.3)." }
+period_b_um   = { value = 0.248, origin = "derived",   source = "0.2865 x 0.240 / 0.277: measured G scaled by the B/G ratio of the QE x IR x 3200 K spectra, same metric (_agentes/_trabajo/3_verificacion.md s.3). The real B (0.262-0.267) is contaminated by G through pylablib's colour-correction matrix." }
+envelope_fwhm_r_um = { value = 3.3, origin = "measured", source = "Envelope FWHM in z, R channel, clean stacks 13-14-36 (2.92) and 04-22 (2.50), corrected for the narrowing caused by the ~20 nm frame z error (real x sim input/output ratio at 20 nm); _agentes/_trabajo/3_verificacion.md s.3 and correction 1." }
+envelope_fwhm_g_um = { value = 1.6, origin = "measured", source = "Same method, G channel: 1.46 and 1.42 measured, corrected for the z-error bias (_agentes/_trabajo/3_verificacion.md s.3)." }
+envelope_fwhm_b_um = { value = 1.16, origin = "derived",  source = "1.6 x 0.87 / 1.20: G scaled by the B/G FWHM ratio of the QE x IR x 3200 K spectra (_agentes/_trabajo/3_verificacion.md correction 1)." }
+illumination_falloff = { value = 0.10, origin = "estimated", source = "Radial illumination drop to the corners; docs/Informe camara attributes most FPN (40-143 DN) to an illumination gradient." }
+
+# ---------------------------------------------------------------------
+# Known surface (synthetic mode). Heights in um, stage coordinates.
+# type: "tilted_plane" | "step" | "sphere" | "flat"
+# ---------------------------------------------------------------------
+[surface]
+type = "tilted_plane"
+base_height_um = 50.0
+tilt_x_um = 2.0          # height change across the full width
+tilt_y_um = 1.0          # height change across the full height
+step_height_um = 0.5     # "step": right half raised by this
+sphere_radius_um = 1000.0
+sphere_cap_um = 3.0      # "sphere": cap height at the centre
+sample_pixel_um = { value = 0.1725, origin = "estimated", source = "3.45 um pixel / 20x: the Mirau objective is unknown (main.tex \\todo). Only used by the sphere." }
+
+# ---------------------------------------------------------------------
+# Piezo: PI E-625.SR + P-611.ZS, through pipython's GCS DLL path
+# ---------------------------------------------------------------------
+[piezo]
+idn_model = "E-625 [SIMULATION]"
+serial_prefix = "SIM-"
+
+[piezo.timing]
+connect_s   = { value = 0.3,   origin = "estimated", source = "DLL load + E816_ConnectUSB: not published. Guess." }
+close_s     = { value = 0.05,  origin = "estimated", source = "Guess." }
+gcs_write_s = { value = 0.002, origin = "estimated", source = "One-way GCS command over USB through the E816 DLL: not published (1_hechos s.5 gap)." }
+gcs_query_s = { value = 0.010, origin = "estimated", source = "GCS query round trip (command + answer): not published. Typical USB-serial round trips are 1-16 ms. pipython adds an ERR? query after EVERY command (code, gcsmessages.py:46)." }
+settle_s    = { value = 0.025, origin = "published", source = "P-611.ZS settling, 10 % step, with E-665.SR and 30 g (https://www.physikinstrumente.com/en/products/nanopositioning-piezo-flexure-stages/linear-piezo-flexure-stages/p-611z-piezo-z-stage-201731). Applied to every step size and to the E-625: estimated transfer." }
+
+[piezo.stage]
+travel_min_um     = { value = 0.0,   origin = "published", source = "P-611.ZS 100 um closed-loop travel (same PI page)." }
+travel_max_um     = { value = 100.0, origin = "published", source = "P-611.ZS 100 um closed-loop travel (https://www.physikinstrumente.com/en/products/nanopositioning-piezo-flexure-stages/linear-piezo-flexure-stages/p-611z-piezo-z-stage-201731)." }
+position_noise_um = { value = 0.02, origin = "measured", source = "Frame-to-frame z error common to all pixels, clean LP126CU stacks 13-14-36 and 04-22: estimator 11.9-17.3 nm / 0.8 calibration = 15-22 nm rms (_agentes/_trabajo/3_verificacion.md s.3, finding 2). Includes vibration and the old app's settling; drawn once per MOV." }
+open_loop_um_per_v = { value = 1.0,  origin = "estimated", source = "~100 um over ~100 V; only for SVA/qVOL (open loop, unreachable from the UI)." }
+
+# ---------------------------------------------------------------------
+# Fault injection (all off by default). Reproducible with `seed`.
+# ---------------------------------------------------------------------
+[faults]
+seed = 777
+snap_timeout_probability = 0.0     # per snap: no frame ever arrives -> timeout
+snap_timeout_every = 0             # every N-th snap times out (0 = never)
+camera_disconnect_after_snaps = 0  # after N snaps the camera "unplugs" (0 = never)
+exposure_apply_factor = 1.0        # camera applies exposure * factor (!= 1 -> app's check fails)
+exposure_ignored = false           # set_exposure silently keeps the previous value
+mov_error_probability = 0.0        # per MOV: controller flags a GCS error
+mov_error_code = -1                # GCS code raised by the failing MOV (ERR? answer)
+piezo_never_on_target = false      # qONT always False -> app times out after 30 s
+piezo_disconnect_after_commands = 0 # after N GCS commands the link drops (0 = never)
+
+# ---------------------------------------------------------------------
+# Replay mode: serve a real stack by z (APPROXIMATION, see README)
+# ---------------------------------------------------------------------
+[replay]
+# First existing folder wins. Relative paths are relative to the repo root.
+# 2026-03-13_13-14-36 first: 11-21-39 and 11-50-20 have 53-64 nm of z drift
+# (_agentes/_trabajo/3_verificacion.md s.3) and must not be used to calibrate.
+datasets = ["/mnt/datos/data/2026-03-13_13-14-36", "data/S1F1"]
+# "auto": 0 if the stack's z range contains surface.base_height_um,
+# otherwise centre the stack on it. Or a number (um added to stack z).
+z_offset_um = "auto"
+cache_frames = 6

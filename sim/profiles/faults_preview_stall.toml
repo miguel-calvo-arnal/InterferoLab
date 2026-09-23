@@ -1,0 +1,22 @@
+# =====================================================================
+# Fault profile: the live preview stream stalls once.
+#
+# After 40 frames of continuous streaming (about 2 s at 21.7 fps) the armed
+# camera stops delivering frames, as a USB/SDK hiccup would.  The stall lasts
+# for that arm only: the app is expected to notice it (no frame within its
+# timeout), say so without a modal dialog, re-arm the camera and carry on.
+#   .venv/bin/python sim/run_simulated.py --profile sim/profiles/faults_preview_stall.toml
+#
+# For a camera that never recovers, raise stream_stall_arms (e.g. 1000):
+#   ... --set faults.stream_stall_arms=1000
+# The app should then give up after a few attempts and say so, still without
+# a modal dialog.  Both keys are off unless a profile or --set turns them on.
+# =====================================================================
+
+[meta]
+name = "faults_preview_stall"
+description = "Fault: the continuous preview stream stalls once after 40 frames (2026-09-22)."
+
+[faults]
+stream_stall_after_frames = 40  # frames of continuous streaming before the stall (0 = never)
+stream_stall_arms = 1           # arms that stay stalled, counting the one that stalls

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from utils import camera_constants as cc
 
 
@@ -47,3 +49,52 @@ def test_all_weights_are_positive_fractions():
         cc.GRAY_W_B,
     ]
     assert all(isinstance(w, float) and 0.0 < w < 1.0 for w in weights)
+
+
+# ---------------------------------------------------------------------------
+# bayer_sites (mosaic phase -> photosite offsets)
+# ---------------------------------------------------------------------------
+def test_bayer_sites_default_is_rggb():
+    """The default phase reproduces the historical RGGB slicing."""
+    assert cc.bayer_sites() == ((0, 0), (0, 1), (1, 0), (1, 1))
+    assert cc.bayer_sites("red") == cc.bayer_sites()
+
+
+def test_bayer_sites_blue_phase_is_bggr():
+    """Phase "blue" (this camera's LP126CU) puts red at the opposite corner."""
+    red, g1, g2, blue = cc.bayer_sites("blue")
+    assert red == (1, 1)
+    assert blue == (0, 0)
+    assert {g1, g2} == {(1, 0), (0, 1)}
+
+
+def test_bayer_sites_green_phases_are_column_and_row_shifts():
+    """The two green-first phases shift red by one column or one row."""
+    assert cc.bayer_sites("green_left_or_red")[0] == (0, 1)
+    assert cc.bayer_sites("green_left_or_blue")[0] == (1, 0)
+
+
+def test_bayer_sites_accepts_both_pylablib_spellings():
+    """pylablib spells the green phases with both "or" and "of"; both work."""
+    assert cc.bayer_sites("green_left_or_red") == cc.bayer_sites("green_left_of_red")
+    assert cc.bayer_sites("green_left_or_blue") == cc.bayer_sites("green_left_of_blue")
+
+
+def test_bayer_sites_all_four_corners_are_distinct():
+    """Every phase covers the four corners of the 2x2 block exactly once."""
+    for phase in cc.BAYER_RED_SITE:
+        assert len(set(cc.bayer_sites(phase))) == 4
+
+
+def test_bayer_sites_greens_are_diagonal_to_each_other():
+    """The two greens always sit on the anti-diagonal of red/blue."""
+    for phase in cc.BAYER_RED_SITE:
+        red, g1, g2, blue = cc.bayer_sites(phase)
+        assert g1 == (red[0], blue[1])
+        assert g2 == (blue[0], red[1])
+
+
+def test_bayer_sites_rejects_unknown_phase():
+    """An unrecognised phase name raises instead of silently defaulting."""
+    with pytest.raises(ValueError, match="Unknown Bayer mosaic phase"):
+        cc.bayer_sites("cyan")

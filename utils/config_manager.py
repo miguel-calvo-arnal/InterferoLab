@@ -34,6 +34,7 @@ _SCHEMA: dict[str, dict[str, dict]] = {
         "end": {"type": float, "min": 0.0, "max": 100.0},
         "step": {"type": float, "min": 0.0, "max": 1.0},
         "manual_z": {"type": float, "min": 0.0, "max": 100.0},
+        "keyboard_step_um": {"type": float, "min": 0.001, "max": 5.0},
         "exposure": {"type": float, "min": 0.01, "max": 10000.0},
         "timeout": {"type": float, "min": 0.5, "max": 10.0},
         "format": {"type": str, "choices": {"bin12", "tiff", "png"}},

@@ -12,11 +12,12 @@ from services.acquisition_service import AcquisitionService
 
 class AcquisitionVM(QObject):
     """
-    ViewModel for the acquisition system (QThread-based sweep + threaded preview).
+    ViewModel for the acquisition system (camera thread + threaded piezo moves).
 
     Responsibilities:
     - Bridge signals between AcquisitionService and UI
-    - Provide simple API (connect, start, cancel, request_preview, move_to)
+    - Provide simple API (connect, start, cancel, start/stop_preview,
+      request_preview, move_to)
     - Convert NumPy preview frames to QPixmap
     - Compute preview histogram data (the view only paints it)
     """
@@ -27,8 +28,13 @@ class AcquisitionVM(QObject):
     previewFrame = Signal(object, float)  # numpy frame + z
     runningChanged = Signal(bool)  # sweep currently running?
     movingChanged = Signal(bool)  # manual piezo move in progress?
+    previewingChanged = Signal(bool)  # live preview stream on/off
+    previewNotice = Signal(str)  # non-blocking camera problem ("" = cleared)
+    sweepAborted = Signal(str)  # sweep stopped early on camera failures (summary)
     positionChanged = Signal(float)  # real piezo Z position, µm
     finished = Signal(str, int, int)  # output folder, skipped frames, total frames
+    connectFinished = Signal(bool)  # connect_hardware() over: ok?
+    disconnectFinished = Signal()  # disconnect_hardware() over
     error = Signal(str)
 
     etaChanged = Signal(float)  # seconds
@@ -50,8 +56,13 @@ class AcquisitionVM(QObject):
         self.svc.logReceived.connect(self._on_log)
         self.svc.runningChanged.connect(self.runningChanged)
         self.svc.movingChanged.connect(self.movingChanged)
+        self.svc.previewingChanged.connect(self.previewingChanged)
+        self.svc.previewNotice.connect(self.previewNotice)
+        self.svc.sweepAborted.connect(self.sweepAborted)
         self.svc.positionChanged.connect(self.positionChanged)
         self.svc.finished.connect(self.finished)
+        self.svc.connectFinished.connect(self.connectFinished)
+        self.svc.disconnectFinished.connect(self.disconnectFinished)
         self.svc.error.connect(self.error)
 
     # ------------------------------------------------------------------
@@ -65,6 +76,17 @@ class AcquisitionVM(QObject):
 
     def disconnect_all(self) -> bool:
         return self.svc.disconnect_all()
+
+    def connect_hardware(self, serial: str, dll: str) -> bool:
+        """Connect piezo + camera off the GUI thread; connectFinished follows."""
+        return self.svc.connect_hardware(serial, dll)
+
+    def disconnect_hardware(self) -> bool:
+        """Release piezo + camera off the GUI thread; disconnectFinished follows."""
+        return self.svc.disconnect_hardware()
+
+    def connection_busy(self) -> str:
+        return self.svc.connection_busy()
 
     def apply_config(self, cfg: dict) -> None:
         self.svc.apply_config(cfg)
@@ -96,8 +118,16 @@ class AcquisitionVM(QObject):
     def move_to(self, z: float) -> None:
         self.svc.move_to(z)
 
+    def start_preview(self) -> bool:
+        """Turn the continuous live preview on (False: refused by the service)."""
+        return bool(self.svc.start_preview())
+
+    def stop_preview(self) -> None:
+        """Turn the continuous live preview off."""
+        self.svc.stop_preview()
+
     def request_preview(self) -> None:
-        """Ask service to capture a single preview frame in background."""
+        """Ask for a single preview frame (snapshot) in the background."""
         self.svc.capture_preview()
 
     # ------------------------------------------------------------------
@@ -172,9 +202,14 @@ class AcquisitionVM(QObject):
 
     @Slot(object, float)
     def _on_preview_frame(self, frame, z: float) -> None:
-        """Forward a preview frame and reuse its z as a position update."""
+        """Forward a preview frame.
+
+        Its z is NOT re-emitted as a position: at ~20 frames per second that
+        would keep snapping the slider and the Manual Z field back to the
+        last set-point while the user is editing them (findings C6, C10).
+        The position indicator follows completed moves and sweep progress.
+        """
         self.previewFrame.emit(frame, z)
-        self.positionChanged.emit(float(z))
 
     @Slot(str, str)
     def _on_log(self, level, message):

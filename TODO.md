@@ -1,6 +1,6 @@
 # TODO — in order of execution
 
-Updated: 2026-08-27 (original list: 2026-04-21)
+Updated: 2026-09-22 (original list: 2026-04-21)
 
 ---
 
@@ -12,10 +12,18 @@ Updated: 2026-08-27 (original list: 2026-04-21)
      `get_exposure` and ABORTS if it differs >5% from the requested value;
      preview errors now reach the UI (they used to be lost silently). Still
      needs confirmation with the real camera.
-   - Make sure the piezo moves to position 50 after connecting. [PENDING lab
-     time] Movement cancellation now responds in ~0.1 s.
-   - Verify the apply buttons of the camera configuration panel. [PENDING lab
-     time]
+   - Make sure the piezo moves to position 50 after connecting. [DONE —
+     2026-09-22] `AcquisitionPanel._on_connect_finished` now sends a normal
+     move to `PARK_POSITION_UM` (50 µm, the centre of the default 45-55 µm
+     sweep range) through the same non-blocking path as any manual move; a
+     failure is a log warning, not a modal. Still needs confirmation with the
+     real piezo (whether 50 was ever the intended park position is Miguel's
+     call, not re-litigated here — see `_agentes/_trabajo/A3_uso.md`).
+   - Verify the apply buttons of the camera configuration panel. [DONE —
+     2026-09-22] "Apply camera settings" now also sends the timeout, not just
+     the exposure (it used to be silently dropped until the next sweep
+     rebuilt the whole config). Exposure was already applying correctly.
+     Real-camera confirmation still pending for the exposure value itself.
 
 2. Review all the code, comment it and make it modular. [DONE — July 2026]
    Full audit + 5 blocks of fixes + a hardware-free test suite.

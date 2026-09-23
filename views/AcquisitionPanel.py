@@ -1,13 +1,13 @@
 # views/AcquisitionPanel.py
 from __future__ import annotations
 
+import math
 import os
-import time
 from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSlider,
-    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -40,13 +39,71 @@ CHANNEL_MODES: tuple[str, ...] = ("mono", "color", "mono_superpixel")
 # (0–100 µm -> 0–10000 ticks, 0.01 µm resolution).
 _Z_SLIDER_SCALE = 100
 
+# Z position the piezo is sent to right after a successful connection
+# (Miguel's decision, item 4/8 of TODO.md): the centre of the default sweep
+# range (45-55 µm), a reasonable place to start looking for fringes.
+PARK_POSITION_UM = 50.0
+
+# Default fine step for keyboard moves (arrow keys on the slider, Manual Z's
+# own spin arrows): 20 nm, the same value as the default sweep step (0.02 µm)
+# -- fine enough to walk through CSI fringes without the old 0.1-1 µm jumps.
+DEFAULT_KEYBOARD_STEP_NM = 20.0
+
+
+class _PositionSlider(QSlider):
+    """QSlider whose keyboard actions also ask for a real piezo move.
+
+    Qt's ``sliderReleased`` is mouse-only: arrow keys, Page Up/Down, Home and
+    End change the value (``triggerAction`` -> ``setValue``) but never emit
+    it, so a bare QSlider only showed a new number on keyboard input without
+    ever moving the hardware (U1/C10).  ``actionTriggered`` fires for every
+    ``triggerAction`` call -- including a plain mouse drag, reported as
+    ``SliderMove`` -- so only the discrete, non-drag actions (single step,
+    page step, home/end) ask for a move here; a drag keeps moving nothing
+    until release, exactly as before.
+    """
+
+    # actionTriggered delivers a plain int (the signal's C++ signature is
+    # `void actionTriggered(int)`); QSlider.SliderAction is a plain Enum in
+    # PySide6, not an IntEnum, so it does NOT compare equal to that int
+    # (verified: `events[0] == QSlider.SliderAction.SliderPageStepAdd` is
+    # False even though both are 3) -- compare against `.value` instead.
+    _STEP_ACTIONS = frozenset(
+        a.value
+        for a in (
+            QSlider.SliderAction.SliderSingleStepAdd,
+            QSlider.SliderAction.SliderSingleStepSub,
+            QSlider.SliderAction.SliderPageStepAdd,
+            QSlider.SliderAction.SliderPageStepSub,
+            QSlider.SliderAction.SliderToMinimum,
+            QSlider.SliderAction.SliderToMaximum,
+        )
+    )
+
+    moveRequested = Signal()
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.actionTriggered.connect(self._on_action_triggered)
+
+    def _on_action_triggered(self, action: int) -> None:
+        if action not in self._STEP_ACTIONS:
+            return
+        # actionTriggered fires BEFORE the slider's own value() reflects the
+        # step (verified against PySide6: value() inside this handler is
+        # still the OLD one; valueChanged, with the new value, follows right
+        # after) -- deferred one tick so Manual Z (fed by valueChanged) has
+        # already caught up by the time the move reads it.  self as context:
+        # cancelled automatically if the slider is destroyed meanwhile.
+        QTimer.singleShot(0, self, self.moveRequested.emit)
+
 
 class AcquisitionPanel(QWidget):
     """
     Acquisition panel with:
             - Full camera/piezo control
-            - Manual movement
-            - Sweep + live preview (before/during/after)
+            - Manual movement (never blocked by the live preview)
+            - Sweep + continuous live preview (paused by the sweep, resumed after)
             - Efficient histogram
             - Real-time progress (elapsed + ETA)
             - Logging
@@ -59,7 +116,17 @@ class AcquisitionPanel(QWidget):
         # Backward-compatible public alias (e.g. MainWindow.closeEvent uses it)
         self.vm = self._vm
         self._hardware_connected = False
+        # Mirrors the live preview stream: set optimistically on the button
+        # and corrected by vm.previewingChanged (e.g. stopped by a camera error).
         self._preview_active = False
+        # Summary of the last sweep that stopped early (set by sweepAborted,
+        # consumed by the finished() that always follows it).
+        self._sweep_abort_summary = ""
+        # True from the moment the post-connect park move (PARK_POSITION_UM)
+        # is sent until it reports back; a failure then is logged, not shown
+        # as a modal (item 4/8 of TODO.md).  Any move the user asks for
+        # meanwhile clears it: a later error is then a real one again.
+        self._auto_park_pending = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -114,22 +181,52 @@ class AcquisitionPanel(QWidget):
         self.sb_manual_z = QDoubleSpinBox()
         self.sb_manual_z.setRange(0, 100)
         self.sb_manual_z.setDecimals(3)
-        self.sb_manual_z.setToolTip("Target position for a manual piezo move, in µm (0–100).")
+        self.sb_manual_z.setToolTip(
+            "Target position for a manual piezo move, in µm (0–100).\n"
+            "Press Enter to move the piezo there; its own arrow keys step\n"
+            "by the keyboard step set below."
+        )
         servo_layout.addWidget(self.sb_manual_z, r, 1)
         r += 1
 
+        servo_layout.addWidget(QLabel("Keyboard step (nm):"), r, 0)
+        self.sb_keyboard_step_nm = QDoubleSpinBox()
+        self.sb_keyboard_step_nm.setRange(1.0, 2000.0)
+        self.sb_keyboard_step_nm.setDecimals(1)
+        self.sb_keyboard_step_nm.setValue(DEFAULT_KEYBOARD_STEP_NM)
+        self.sb_keyboard_step_nm.setToolTip(
+            "Step size for a single arrow-key press on the Z slider or on\n"
+            "Manual Z, in nm. Fine enough to walk through fringes; coarser\n"
+            "searches still use the slider's page step (1 µm) or a typed\n"
+            "target. Saved in the configuration."
+        )
+        servo_layout.addWidget(self.sb_keyboard_step_nm, r, 1)
+        r += 1
+
         # Piezo position slider: control + live indicator of the real position
-        self.sl_z = QSlider(Qt.Horizontal)
+        self.sl_z = _PositionSlider(Qt.Horizontal)
         self.sl_z.setRange(0, 100 * _Z_SLIDER_SCALE)  # 0–100 µm, 0.01 µm ticks
-        self.sl_z.setSingleStep(10)  # 0.1 µm per arrow key
         self.sl_z.setPageStep(_Z_SLIDER_SCALE)  # 1 µm per groove click
         self.sl_z.setToolTip(
             "Piezo Z position, 0–100 µm (0.01 µm resolution).\n"
             "Drag to pick a target (Manual Z follows live); the piezo moves\n"
-            "when the handle is released. Tracks the real position during\n"
-            "moves, previews and sweeps (read-only while busy)."
+            "when the handle is released, also while the live preview runs.\n"
+            "Arrow keys, Page Up/Down, Home and End move it for real too, by\n"
+            "the keyboard step set above (Page/Home/End use the page step).\n"
+            "Shows the MEASURED position read from the controller: live during\n"
+            "moves, after each move (also a failed one) and during sweeps\n"
+            "(read-only while busy)."
         )
         servo_layout.addWidget(self.sl_z, r, 0, 1, 2)
+        r += 1
+
+        # The measured position as a number: the slider alone cannot show
+        # nanometres, and "unknown" must be said, not drawn as 0.
+        self.lbl_z_measured = QLabel("Measured Z: —")
+        self.lbl_z_measured.setToolTip(
+            "Piezo position read from the controller (qPOS), not the target."
+        )
+        servo_layout.addWidget(self.lbl_z_measured, r, 0, 1, 2)
         r += 1
 
         self.btn_move_piezo = QPushButton("Move piezo")
@@ -199,20 +296,8 @@ class AcquisitionPanel(QWidget):
             "Use Color when one channel may be corrupted."
         )
         out_layout.addWidget(self.cmb_channels, r, 1)
-        r += 1
-
-        out_layout.addWidget(QLabel("Preview interval (ms):"), r, 0)
-        self.sb_preview_int = QSpinBox()
-        self.sb_preview_int.setRange(200, 10000)
-        self.sb_preview_int.setValue(1000)
-        self.sb_preview_int.setToolTip("Time between live preview captures, in ms (200–10000).")
-        out_layout.addWidget(self.sb_preview_int, r, 1)
-        r += 1
-
-        self.btn_apply_preview = QPushButton("Apply preview interval")
-        self.btn_apply_preview.setIcon(icon("check.svg"))
-        self.btn_apply_preview.setToolTip("Apply the interval to the live preview timer.")
-        out_layout.addWidget(self.btn_apply_preview, r, 0, 1, 2)
+        # No "preview interval" any more: the live preview is a continuous
+        # stream (camera armed once) that always shows the newest frame.
 
         layout.addLayout(self._make_hbox(servo_box, cam_box, out_box))
 
@@ -257,6 +342,15 @@ class AcquisitionPanel(QWidget):
         preview_row.addWidget(self._hist_plot, stretch=2)
         layout.addLayout(preview_row)
 
+        # Camera problems that must not interrupt the user (live preview
+        # retrying or given up, exposure not applied): shown here, in the
+        # window, never as a modal dialog.  Hidden while there is nothing to say.
+        self.lbl_camera_status = QLabel("")
+        self.lbl_camera_status.setObjectName("cameraStatus")  # styled in styles.qss
+        self.lbl_camera_status.setWordWrap(True)
+        self.lbl_camera_status.setVisible(False)
+        layout.addWidget(self.lbl_camera_status)
+
         # ============================================================
         #  Progress + ETA
         # ============================================================
@@ -286,7 +380,9 @@ class AcquisitionPanel(QWidget):
 
         self.btn_preview = QPushButton("Start preview")
         self.btn_preview.setIcon(self._icon_eye)
-        self.btn_preview.setToolTip("Start or stop the live camera preview.")
+        self.btn_preview.setToolTip(
+            "Start or stop the live camera preview (continuous, newest frame shown)."
+        )
 
         self.btn_start = QPushButton("Start sweep")
         theme.set_variant(self.btn_start, "primary")
@@ -325,7 +421,6 @@ class AcquisitionPanel(QWidget):
         self.btn_cancel.clicked.connect(self._cancel)
         self.btn_move_piezo.clicked.connect(self._move_piezo_manual)
         self.btn_apply_cam.clicked.connect(self._apply_camera_params)
-        self.btn_apply_preview.clicked.connect(self._apply_preview_interval)
         self.cmb_channels.currentIndexChanged.connect(self._on_channel_mode_changed)
 
         # Piezo slider <-> spinbox <-> real position (loop-free: the guard
@@ -335,6 +430,18 @@ class AcquisitionPanel(QWidget):
         self.sl_z.sliderReleased.connect(self._on_slider_released)
         self._vm.positionChanged.connect(self._on_position_changed)
 
+        # Keyboard moves the piezo for real (U1/C10, U7): the slider's own
+        # step actions (arrow/page/home/end, not a drag) and Enter on Manual Z
+        # both reuse the normal manual-move path.  returnPressed, not
+        # editingFinished (H4, batch 5 review): editingFinished also fires on
+        # a plain focus loss (e.g. Tab, or clicking "Move piezo" itself),
+        # which used to send an extra, unasked-for move to whatever the field
+        # happened to show.
+        self.sl_z.moveRequested.connect(self._move_piezo_manual)
+        self.sb_manual_z.lineEdit().returnPressed.connect(self._move_piezo_manual)
+        self.sb_keyboard_step_nm.valueChanged.connect(self._on_keyboard_step_changed)
+        self._on_keyboard_step_changed(self.sb_keyboard_step_nm.value())
+
         self._vm.progressChanged.connect(self._on_progress)
         self._vm.etaChanged.connect(self._progress_info.set_eta)
         self._vm.elapsedChanged.connect(self._progress_info.set_elapsed)
@@ -342,14 +449,13 @@ class AcquisitionPanel(QWidget):
         self._vm.previewFrame.connect(self._on_preview)
         self._vm.runningChanged.connect(self._on_running)
         self._vm.movingChanged.connect(self._on_moving)
+        self._vm.previewingChanged.connect(self._on_previewing_changed)
+        self._vm.previewNotice.connect(self._on_preview_notice)
+        self._vm.sweepAborted.connect(self._on_sweep_aborted)
         self._vm.finished.connect(self._on_finished)
+        self._vm.connectFinished.connect(self._on_connect_finished)
+        self._vm.disconnectFinished.connect(self._on_disconnect_finished)
         self._vm.error.connect(self._on_error)
-
-        # Idle preview timer (only fires when preview_active and not running)
-        self._live_timer = QTimer(self)
-        self._live_timer.setInterval(self.sb_preview_int.value())
-        self._live_timer.stop()
-        self._live_timer.timeout.connect(self._request_live_preview)
 
         self._update_button_states()
 
@@ -390,6 +496,26 @@ class AcquisitionPanel(QWidget):
         # indicator — setValue still works on a disabled QSlider.
         self.sl_z.setEnabled(self._hardware_connected and not busy)
 
+        connection = self._vm.connection_busy()  # "connecting" / "disconnecting" / ""
+        if connection:
+            # Everything frozen until the connection thread reports back:
+            # no second connect, no disconnect half-way through a connect.
+            self.btn_connect.setText(
+                "Connecting…" if connection == "connecting" else "Disconnecting…"
+            )
+            for w in (
+                self.btn_connect,
+                self.le_piezo_serial,
+                self.btn_preview,
+                self.btn_start,
+                self.btn_cancel,
+                self.btn_move_piezo,
+                self.btn_apply_cam,
+                self.sl_z,
+            ):
+                w.setEnabled(False)
+            return
+
         if not self._hardware_connected:
             self.btn_connect.setText("Connect hardware")
             self.btn_connect.setIcon(self._icon_plug)
@@ -405,7 +531,6 @@ class AcquisitionPanel(QWidget):
 
             self.btn_move_piezo.setEnabled(False)
             self.btn_apply_cam.setEnabled(False)
-            self.btn_apply_preview.setEnabled(False)
             return
 
         # Hardware connected: lock the serial field to prevent accidental changes
@@ -417,8 +542,9 @@ class AcquisitionPanel(QWidget):
         self.btn_start.setEnabled(not busy)
         self.btn_cancel.setEnabled(running)  # cancel only meaningful during sweep
         self.btn_move_piezo.setEnabled(not busy)
+        # Exposure changes are applied by the camera thread between frames,
+        # so they are allowed while the live preview runs.
         self.btn_apply_cam.setEnabled(not busy)
-        self.btn_apply_preview.setEnabled(not busy)
 
         # Preview
         if busy:
@@ -471,22 +597,26 @@ class AcquisitionPanel(QWidget):
         """
         Connect or disconnect hardware depending on current state.
 
-        - If already connected and no sweep is running: disconnect everything.
-        - If not connected: apply current UI parameters and connect camera
-        (and piezo when the bypass is removed).
+        Both run on the service's connection thread (the window keeps
+        painting and answering, findings C8/R9); the button says
+        "Connecting…" / "Disconnecting…" and everything else is frozen until
+        connectFinished / disconnectFinished arrive.  A second click while
+        one is in progress does nothing.
         """
-        # If already connected and not running -> disconnect
-        if self._hardware_connected and not self._vm.is_running():
-            self._vm.disconnect_all()
-            self._hardware_connected = False
-            self._preview_active = False
-            self._live_timer.stop()
-            self._append_log("Hardware disconnected.")
-            self._update_button_states()
+        if self._vm.connection_busy():
             return
 
-        # If connected but running, do nothing (button should be disabled anyway)
-        if self._hardware_connected and self._vm.is_running():
+        if self._hardware_connected:
+            # Never in the middle of a sweep or a move (they use the piezo;
+            # the button is disabled then anyway).  The camera is closed by
+            # its own thread; the GUI never touches it.
+            if self._vm.is_running() or self._vm.is_moving():
+                return
+            if self._vm.disconnect_hardware():
+                self._preview_active = False
+                self._on_preview_notice("")
+                self._append_log("Disconnecting hardware…")
+            self._update_button_states()
             return
 
         # 1) Apply current UI parameters to backend configuration BEFORE connecting
@@ -499,41 +629,66 @@ class AcquisitionPanel(QWidget):
             }
         )
 
-        # 2) Connect hardware using that configuration
+        # 2) Connect hardware using that configuration (connection thread)
+        serial = self.le_piezo_serial.text().strip()
+        if not serial:
+            # No hardcoded fallback (U9): an empty field used to connect
+            # silently to whichever controller happened to be in the code.
+            self._append_log("[WARN] Piezo serial is empty; connect cancelled.")
+            QMessageBox.warning(
+                self,
+                "Piezo serial required",
+                "Enter the piezo controller's serial number before connecting.\n"
+                "It is saved to your local configuration once entered.",
+            )
+            return
         dll_path = resource_path(os.path.join("API", "PI", "E816_DLL_x64.dll"))
-        serial = self.le_piezo_serial.text().strip() or "125056199"
-        ok1 = self._vm.connect_piezo(serial, dll_path)
-        ok2 = self._vm.connect_camera()
+        if self._vm.connect_hardware(serial, dll_path):
+            self._append_log("Connecting hardware…")
+        self._update_button_states()
 
-        self._hardware_connected = bool(ok1 and ok2)
-
-        if self._hardware_connected:
+    @Slot(bool)
+    def _on_connect_finished(self, ok: bool) -> None:
+        """The connection thread is done: connected, or failed and released."""
+        self._hardware_connected = bool(ok)
+        self._preview_active = False
+        if ok:
             # Preview always starts OFF after connecting; the user enables it
-            # explicitly with the Start preview button.
-            self._preview_active = False
-            self._live_timer.stop()
-            # Request one picture to show and avoid start_acquisition() to wait forever and
-            # freeze the GUI
+            # explicitly with the Start preview button.  One snapshot shows
+            # the field of view meanwhile.
             self._vm.request_preview()
-
             self._append_log(
                 f"Hardware connected successfully. Parameters applied "
                 f"(exposure={self.sb_exposure.value():.3f} ms, "
                 f"timeout={self.sb_timeout.value():.2f} s)."
             )
-        else:
-            self._preview_active = False
-            self._live_timer.stop()
-            self._vm.disconnect_all()
-            self._append_log("[ERROR] Could not connect hardware. See log for details.")
-            QMessageBox.critical(
-                self,
-                "Hardware connection failed",
-                "Could not connect to piezo or camera.\n\n"
-                "Check that the hardware is powered on, the serial number is correct, "
-                "and no other application is using the devices.",
-            )
+            # Item 4/8 of TODO.md (Miguel's decision): park at a known,
+            # centred Z after connecting.  Same path as any manual move (the
+            # service, never the hardware directly) and non-blocking: the
+            # window is usable immediately, the preview above keeps running,
+            # and _on_error shows a log warning instead of a modal if it fails.
+            self._auto_park_pending = True
+            self._append_log(f"Parking piezo at {PARK_POSITION_UM:.1f} µm…")
+            self._vm.move_to(PARK_POSITION_UM)
+            self._update_button_states()
+            return
+        # Whatever was opened has already been released by the service.
+        self._update_button_states()
+        self._append_log("[ERROR] Could not connect hardware. See log for details.")
+        QMessageBox.critical(
+            self,
+            "Hardware connection failed",
+            "Could not connect to piezo or camera.\n\n"
+            "Check that the hardware is powered on, the serial number is correct, "
+            "and no other application is using the devices.",
+        )
 
+    @Slot()
+    def _on_disconnect_finished(self) -> None:
+        self._hardware_connected = False
+        self._preview_active = False
+        self._auto_park_pending = False
+        self._append_log("Hardware disconnected.")
         self._update_button_states()
 
     @Slot()
@@ -549,15 +704,32 @@ class AcquisitionPanel(QWidget):
         self._preview_active = not self._preview_active
 
         if self._preview_active:
-            interval = self.sb_preview_int.value()
-            self._live_timer.setInterval(interval)
-            self._live_timer.start()
-            self._append_log(f"Preview started (interval={interval} ms).")
+            self._on_preview_notice("")  # a fresh start: forget the last problem
+            if not self._vm.start_preview():
+                # Refused (hardware connecting/disconnecting): never show
+                # "Stop preview" without a stream (review H2 of batch 4).
+                self._preview_active = False
+                self._append_log("[WARN] Preview not started: hardware is busy.")
+                self._update_button_states()
+                return
+            self._append_log("Preview started (continuous).")
         else:
-            self._live_timer.stop()
+            self._vm.stop_preview()
             self._append_log("Preview stopped.")
 
         self._update_button_states()
+
+    @Slot(bool)
+    def _on_previewing_changed(self, active: bool) -> None:
+        """The camera thread says the live preview is on/off (also after an error)."""
+        self._preview_active = bool(active)
+        self._update_button_states()
+
+    @Slot(str)
+    def _on_preview_notice(self, text: str) -> None:
+        """Show (or clear, with "") a camera problem without interrupting the user."""
+        self.lbl_camera_status.setText(text)
+        self.lbl_camera_status.setVisible(bool(text))
 
     @Slot(int)
     def _on_channel_mode_changed(self, index: int) -> None:
@@ -565,35 +737,12 @@ class AcquisitionPanel(QWidget):
         self._vm.apply_config({"color_mode": mode})
         self._set_histogram_mode("color" if mode == "color" else "mono")
 
-    def _wait_preview_idle(self, extra_timeout_s: float = 2.0) -> bool:
-        """
-        Wait for any in-flight preview capture to finish before a sweep.
-
-        Spins the event loop (bounded by the camera timeout plus a margin)
-        so the preview thread can deliver its finished signal. Returns True
-        when no preview capture is in flight.
-        """
-        if not self._vm.is_previewing():
-            return True
-
-        self._append_log("Waiting for in-flight preview capture to finish…")
-        deadline = time.monotonic() + self.sb_timeout.value() + extra_timeout_s
-        while self._vm.is_previewing() and time.monotonic() < deadline:
-            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
-            time.sleep(0.02)
-        return not self._vm.is_previewing()
-
     @Slot()
     def _start(self):
-        # Stop the live preview BEFORE starting the sweep so the preview
-        # thread and the sweep thread can never use the camera concurrently.
-        self._preview_active = False
-        self._live_timer.stop()
-        if not self._wait_preview_idle():
-            self._append_log("[ERROR] Preview capture did not finish in time; sweep not started.")
-            self._update_button_states()
-            return
-
+        # No waiting for the preview here: the sweep runs on the camera
+        # thread, which stops the live stream itself before the first step
+        # and re-arms it afterwards if it was on.  Nothing spins the event
+        # loop, so no click can sneak in while a sweep is being started.
         cfg = {
             "closed_loop": True,
             "start": self.sb_start.value(),
@@ -603,7 +752,6 @@ class AcquisitionPanel(QWidget):
             "timeout": self.sb_timeout.value(),
             "format": self.cmb_format.currentText(),
             "color_mode": self._current_channel_mode(),
-            "preview_interval": self.sb_preview_int.value(),
             "axis": "A",
             "settle": 0.2,
             "output_folder": "data",
@@ -624,6 +772,10 @@ class AcquisitionPanel(QWidget):
 
     @Slot()
     def _move_piezo_manual(self):
+        # The user is taking over (button, slider release/keys, or Enter on
+        # Manual Z): a later move error is a real one again, not the
+        # post-connect park's (which may still be settling in the background).
+        self._auto_park_pending = False
         if not self._hardware_connected:
             self._append_log("[WARN] Hardware not connected.")
             return
@@ -638,6 +790,16 @@ class AcquisitionPanel(QWidget):
     # ============================================================
     #  Piezo slider (control + position indicator)
     # ============================================================
+    @Slot(float)
+    def _on_keyboard_step_changed(self, value_nm: float) -> None:
+        """Apply the fine keyboard step (nm) to the slider's arrow-key step
+        and to Manual Z's own spin arrows (U8: the Qt default -- 0.1 µm on
+        the slider, 1 µm on the spinbox -- was too coarse for walking
+        through fringes)."""
+        step_um = value_nm / 1000.0
+        self.sl_z.setSingleStep(max(1, round(step_um * _Z_SLIDER_SCALE)))
+        self.sb_manual_z.setSingleStep(step_um)
+
     @Slot(int)
     def _on_slider_value_changed(self, value: int) -> None:
         """Mirror slider drags into the Manual Z spinbox. Never moves hardware."""
@@ -661,22 +823,37 @@ class AcquisitionPanel(QWidget):
 
     @Slot(float)
     def _on_position_changed(self, z: float) -> None:
-        """Reflect the real piezo position on the slider and the spinbox.
+        """Reflect the MEASURED piezo position (NaN = unknown).
 
-        Fed by manual-move completion, sweep progress and preview frames.
-        Widget signals are blocked so an indicator update can never trigger
-        a move; skipped while the user is dragging the handle.
+        Fed by the connection, manual moves (live and at the end, also a
+        failed one) and sweep progress; never by preview frames.  Widget
+        signals are blocked so an indicator update can never trigger a move.
+        The slider is skipped while the user drags it OR while it has
+        keyboard focus (H3, batch 5 review: arrow/page/home/end keys need
+        that focus, and Qt computes each step from the slider's OWN current
+        value -- overwriting it mid-sequence lost steps on a held key, 8
+        presses landing at 5 µm instead of 8).  Skipping the slider here also
+        leaves Manual Z alone (it mirrors the slider via valueChanged, not
+        this method), which matters just as much: it is what a keyboard move
+        actually sends.  The Manual Z field is separately skipped while IT
+        has the keyboard focus (typing the next target during a followed
+        move).
         """
-        if self.sl_z.isSliderDown():
+        if math.isnan(z):
+            self.lbl_z_measured.setText("Measured Z: unknown (could not be read)")
             return
+        self.lbl_z_measured.setText(f"Measured Z: {z:.3f} µm")
+        if self.sl_z.isSliderDown() or self.sl_z.hasFocus():
+            return  # the user is choosing a target on the slider right now
         self._z_sync_guard = True
         try:
             self.sl_z.blockSignals(True)
             self.sl_z.setValue(round(z * _Z_SLIDER_SCALE))
             self.sl_z.blockSignals(False)
-            self.sb_manual_z.blockSignals(True)
-            self.sb_manual_z.setValue(z)
-            self.sb_manual_z.blockSignals(False)
+            if not self.sb_manual_z.hasFocus():
+                self.sb_manual_z.blockSignals(True)
+                self.sb_manual_z.setValue(z)
+                self.sb_manual_z.blockSignals(False)
         finally:
             self._z_sync_guard = False
 
@@ -686,20 +863,22 @@ class AcquisitionPanel(QWidget):
             self._append_log("[WARN] Hardware not connected.")
             return
 
-        self._vm.apply_config({"exposure": self._exposure_s()})
+        # The timeout is not a camera-hardware setting (nothing to send to
+        # the SDK): it only needs to reach the service's config, which
+        # preview_start()/capture_preview() re-read on every call. Without
+        # this it silently kept the value from connect (or the last sweep)
+        # until the next sweep rebuilt the whole config (TODO.md item 1, U5).
+        self._vm.apply_config({"exposure": self._exposure_s(), "timeout": self.sb_timeout.value()})
         if self._vm.connect_camera():
+            # Exposure applied by the camera thread between frames; it logs
+            # the confirmation ("Camera exposure updated to ...") when done.
+            # The timeout takes effect immediately (no camera call needed).
             self._append_log(
-                f"Camera parameters applied (exposure={self.sb_exposure.value():.3f} ms)."
+                f"Applying camera parameters (exposure={self.sb_exposure.value():.3f} ms, "
+                f"timeout={self.sb_timeout.value():.2f} s)…"
             )
         else:
             self._append_log("[ERROR] Failed to apply camera parameters.")
-
-    @Slot()
-    def _apply_preview_interval(self):
-        interval = self.sb_preview_int.value()
-        self._live_timer.setInterval(interval)
-        self._append_log(f"Preview interval set to {interval} ms.")
-        # If preview active, timer is already running.
 
     @Slot(float)
     def _on_start_changed(self, value: float) -> None:
@@ -711,9 +890,26 @@ class AcquisitionPanel(QWidget):
         """Ensure 'Start' is always <= 'End'."""
         self.sb_start.setMaximum(value)
 
+    @Slot(str)
+    def _on_sweep_aborted(self, summary: str) -> None:
+        """Remember why the sweep stopped early; _on_finished (next) reports it."""
+        self._sweep_abort_summary = summary
+
     @Slot(str, int, int)
     def _on_finished(self, output_folder: str, skipped: int, total: int) -> None:
         """Report sweep completion (and warn about incomplete datasets)."""
+        aborted = self._sweep_abort_summary
+        self._sweep_abort_summary = ""
+        if aborted:
+            # Modal on purpose: the sweep ended without the dataset the user
+            # asked for, and nobody may analyse the folder as if it were whole.
+            msg = (
+                f"{aborted}\n\nThe folder is marked with SWEEP_ABORTED.txt. "
+                "Check the camera (cable, power) and the free disk space before starting another sweep."
+            )
+            self._append_log(f"[WARN] {aborted}")
+            QMessageBox.warning(self, "Sweep aborted", msg)
+            return
         self._append_log(f"Sweep finished. Images saved to: {output_folder}")
         if skipped > 0:
             acquired = total - skipped
@@ -727,9 +923,27 @@ class AcquisitionPanel(QWidget):
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
+        """Errors that need the user's attention: a failed sweep or a failed
+        piezo move (the stage may not be where the window says).  Live
+        preview and exposure problems never come here: they are shown in
+        lbl_camera_status (see _on_preview_notice).
+
+        The live preview state is NOT touched here: a piezo error must not
+        stop the camera stream (finding C7b).
+        """
+        message = message.strip() or "Unknown error (no details were given)."
+        if self._auto_park_pending:
+            # The automatic post-connect move failed (item 4/8 of TODO.md):
+            # non-blocking by design, a log line is enough -- the user just
+            # connected and did not ask for this move themselves.
+            self._auto_park_pending = False
+            self._append_log(
+                f"[WARN] Could not park the piezo at {PARK_POSITION_UM:.1f} µm "
+                f"after connecting: {message}"
+            )
+            self._update_button_states()
+            return
         self._append_log(f"[ERROR] {message}")
-        self._preview_active = False
-        self._live_timer.stop()
         self._update_button_states()
         QMessageBox.critical(self, "Acquisition error", message)
 
@@ -742,16 +956,26 @@ class AcquisitionPanel(QWidget):
 
     @Slot(bool)
     def _on_running(self, running):
+        # The camera thread pauses and resumes the live preview around the
+        # sweep by itself; only the button matrix changes here.
         if running:
-            self._live_timer.stop()
-        else:
-            if self._hardware_connected and self._preview_active:
-                self._live_timer.start()
+            # Defensive backstop for H2 (batch 5 review): a sweep cannot
+            # legitimately start while the park move is still in progress
+            # (start() refuses it), but if it ever did, its own failure must
+            # not be swallowed as "the park's".
+            self._auto_park_pending = False
         self._update_button_states()
 
     @Slot(bool)
     def _on_moving(self, moving: bool) -> None:
         """Update button states whenever a manual move starts or finishes."""
+        if not moving:
+            # H2 (batch 5 review): the park move is over. A failure already
+            # cleared the flag itself in _on_error; a SUCCESSFUL park never
+            # went through _on_error, so without this the flag would still
+            # be set and swallow the next, unrelated error (e.g. a failed
+            # sweep) as if it were the park's, with no modal.
+            self._auto_park_pending = False
         self._update_button_states()
 
     # ============================================================
@@ -777,14 +1001,6 @@ class AcquisitionPanel(QWidget):
         self._update_histogram(arr)
 
     # ============================================================
-    #  Timer-driven request
-    # ============================================================
-    @Slot()
-    def _request_live_preview(self):
-        if self._hardware_connected and self._preview_active and not self._vm.is_running():
-            self._vm.request_preview()
-
-    # ============================================================
     #  Public helpers (keyboard shortcuts in MainWindow)
     # ============================================================
     def trigger_start(self) -> None:
@@ -808,11 +1024,11 @@ class AcquisitionPanel(QWidget):
             "end": self.sb_end.value(),
             "step": self.sb_step.value(),
             "manual_z": self.sb_manual_z.value(),
+            "keyboard_step_um": self.sb_keyboard_step_nm.value() / 1000.0,
             "exposure": self.sb_exposure.value(),
             "timeout": self.sb_timeout.value(),
             "format": self.cmb_format.currentText(),
             "color_mode": self._current_channel_mode(),
-            "preview_interval": self.sb_preview_int.value(),
         }
 
     def apply_saved_config(self, cfg: dict) -> None:
@@ -827,6 +1043,8 @@ class AcquisitionPanel(QWidget):
             self.sb_step.setValue(float(cfg["step"]))
         if "manual_z" in cfg:
             self.sb_manual_z.setValue(float(cfg["manual_z"]))
+        if "keyboard_step_um" in cfg:
+            self.sb_keyboard_step_nm.setValue(float(cfg["keyboard_step_um"]) * 1000.0)
         if "exposure" in cfg:
             self.sb_exposure.setValue(float(cfg["exposure"]))
         if "timeout" in cfg:
@@ -840,15 +1058,14 @@ class AcquisitionPanel(QWidget):
             self.cmb_channels.setCurrentIndex(
                 CHANNEL_MODES.index(mode) if mode in CHANNEL_MODES else 0
             )
-        if "preview_interval" in cfg:
-            self.sb_preview_int.setValue(int(cfg["preview_interval"]))
+        # "preview_interval" (older configs) is accepted and ignored: the
+        # live preview no longer has a timer.
 
     # ============================================================
     #  Close
     # ============================================================
     def closeEvent(self, event):
         self._preview_active = False
-        self._live_timer.stop()
         try:
             # Cancel any sweep, stop worker threads and disconnect hardware.
             self._vm.shutdown()

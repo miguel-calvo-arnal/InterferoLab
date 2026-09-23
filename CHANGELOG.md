@@ -446,3 +446,497 @@ The Bayer-weights LaTeX report was translated to English and renamed
 `docs/` (references updated). Both platform releases regenerated with all the
 review fixes (2026-08-28 linux tar.gz + windows zip); the 08-27 artifacts were
 retired.
+
+---
+
+## Raw Bayer output on color cameras (2026-09-08)
+
+**Sweep failure in the lab.** Every frame was dropped with
+`_bayer_to_superpixel expects a 2-D Bayer frame, got shape (3000, 4096, 3)`.
+Cause: `pylablib`'s `ThorlabsTLCamera` calls `set_color_format()` with
+`color_output="auto"` on construction, which resolves to `"rgb"` on a color
+sensor, so `snap()` returned a software-debayered `(H, W, 3)` array. The
+existing guard in `connect_camera()` tried `get_all_pixel_formats()` /
+`set_pixel_format("Mono16")`, methods that do not exist in `pylablib`'s
+TLCamera class: the call raised `AttributeError`, was swallowed by the
+`except` branch as a warning, and the camera stayed in RGB mode.
+
+`connect_camera()` now calls `cam.set_color_format(color_output="raw",
+color_space="linear")` and **raises** if that fails (silently continuing means
+a whole sweep of dropped frames). It also reads `get_color_info()` and warns
+if the sensor's Bayer phase is not `red` (RGGB), which is what the superpixel
+weights and `_bayer_to_color_superpixel` assume.
+
+## Bayer mosaic phase read from the sensor (2026-09-09)
+
+**Wrong colours in the live preview.** With raw output working, the colour
+preview showed a wrong cast: the three superpixel merges hardcoded an RGGB
+mosaic (red at `[0, 0]`), but this camera reports
+`get_color_info().filter_array_phase == "blue"` — a **BGGR** sensor. The guard
+added the day before did detect it and logged a warning, but nothing acted on
+it.
+
+The consequences were not limited to the preview:
+
+- Colour mode: the R and B channels were swapped, in the preview *and* in the
+  saved `.bin12`/TIFF frames.
+- Mono and `mono_superpixel` modes: `BAYER_W_R` (0.257) was applied to the blue
+  photosite and `BAYER_W_B` (0.120) to the red one. Silent, but a real
+  photometric error — the greens were unaffected, since `W_G1 == W_G2`.
+
+`utils/camera_constants.py` now owns the mosaic phase alongside the weights:
+`BAYER_RED_SITE` maps each phase name to the position of the red photosite, and
+`bayer_sites(phase)` returns the four `(row, col)` offsets (both pylablib
+spellings of the green phases are accepted — its enum says `green_left_or_red`
+and its own debayering code says `green_left_of_red`). `connect_camera()` reads
+the phase, validates it and stores it; the three `_bayer_to_*` merges take it as
+an argument and default to RGGB, so the historical path stays **bit-exact**.
+An unrecognised phase name falls back to RGGB with a warning instead of
+aborting the connection.
+
+The ROI is never moved (only `hbin`/`vbin` are reset), so the sensor-level phase
+stays valid for the acquired frames.
+
+12 new tests (319 total): phase→offset mapping, both spellings, R/B swap under
+BGGR, bit-exactness of the default path, and phase propagation through the
+binned mono merge.
+
+**Data taken on 2026-09-08 is affected**: colour stacks have R and B swapped,
+and mono stacks were merged with the red and blue weights exchanged.
+
+## Keyboard piezo moves, fine step, camera timeout apply, park on connect (2026-09-22)
+
+Phase-2 batch 5 (fix 4/8/9 of the verified diagnosis: findings U1/C10, U8,
+U5/TODO.md item 1, and Miguel's decision to park the piezo on connect; plus
+U9, the piezo serial still in the code).
+
+### Why
+
+- Arrow keys, Page Up/Down, Home and End on the Z slider changed the number
+  shown but never sent a move: `sliderReleased` is mouse-only, so the
+  keyboard looked like it worked and silently did nothing (U1/C10). Enter on
+  Manual Z had no connection at all (U7). Both are exactly the fine control
+  needed to walk into a fringe position while watching the preview.
+- The slider's own arrow-key step (0.1 µm) and Manual Z's default spin step
+  (1 µm, Qt's default -- `setSingleStep` was never called) were both too
+  coarse for that (U8).
+- "Apply camera settings" only ever sent the exposure; the timeout typed in
+  the same box did nothing until the next sweep rebuilt the whole config
+  (U5, TODO.md item 1).
+- The piezo never moved to a known position after connecting -- the code for
+  it did not exist (TODO.md item 1; A3's finding was that only *disconnect*
+  parks at 0). Miguel decided it should go to 50 µm on a successful connect.
+- `views/AcquisitionPanel.py` still had a hardcoded serial number as a silent
+  fallback when the serial field was left empty (U9): the real lab serial
+  stayed in the repository (and its public mirror) despite an earlier commit
+  meant to remove it.
+
+### What changed
+
+- New `views.AcquisitionPanel._PositionSlider` (what `sl_z` now is): listens
+  to `actionTriggered` and asks for a move on every discrete step action
+  (single/page step, home/end) but never on a drag (`SliderMove`, the same
+  action a mouse release already handles). `actionTriggered` fires *before*
+  the slider's own `value()` updates (verified against PySide6), so the
+  request is deferred one event-loop tick (`QTimer.singleShot(0, self, ...)`,
+  the same pattern as `widgets/HeightmapView.py`) so it reads the settled
+  target, not the one it is about to leave. A burst of key presses before
+  the loop turns asks for a move once per key, all with the same final
+  value -- `move_to`'s own "last order wins" already absorbs that; nothing
+  new is queued.
+- `sb_manual_z.lineEdit().returnPressed` (Enter) now triggers a move, reusing
+  `_move_piezo_manual` exactly like the slider release and the "Move piezo"
+  button.
+- New "Keyboard step (nm):" spin box (`sb_keyboard_step_nm`, default 20 nm --
+  the same value as the default sweep step, 0.02 µm, a reasonable step for
+  CSI fringe hunting): sets both the slider's arrow-key step and Manual Z's
+  own spin step live, and is persisted as `keyboard_step_um` in
+  `app_config.json` (schema entry added to `utils/config_manager.py`). The
+  slider's page step (1 µm, a groove click or Page Up/Down) and pageStep are
+  unchanged. Tooltips corrected on the slider and Manual Z.
+- `_apply_camera_params` now sends `{"exposure": ..., "timeout": ...}` to
+  `apply_config` instead of only the exposure. Nothing else needed to
+  change: `start_preview()`/`capture_preview()` already re-read
+  `self._cfg["timeout"]` on every call, so the value only had to reach the
+  config, not the camera hardware.
+- `_on_connect_finished(True)` now also sends a move to `PARK_POSITION_UM`
+  (50 µm) through `AcquisitionVM.move_to` -- the exact same service path as
+  any manual move, never the hardware directly, and non-blocking like
+  everything else in this window. A new `_auto_park_pending` flag makes a
+  failed park a log warning (`_on_error`) instead of the usual modal: the
+  user just connected and did not ask for this move. The flag is cleared by
+  any move the user asks for afterwards (button, slider, Enter), when the
+  park move itself finishes (success or failure, `movingChanged(False)`),
+  and when a sweep starts (defensive backstop), so a later real error goes
+  back to being a dialog instead of being swallowed as a fake park failure.
+- `le_piezo_serial`'s hardcoded fallback serial is gone. An empty field
+  at connect time cancels the attempt with a log warning and a
+  `QMessageBox.warning` ("Piezo serial required") instead of silently
+  reaching a specific controller; the real serial is no longer anywhere in
+  a versioned file (a test walks every git-tracked file and fails if it
+  reappears). The serial still comes from `app_config.json` (local, not
+  versioned) or the user's own typing, as before.
+- After review (`_agentes/_trabajo/B2_revision_lote5.md`): the real piezo
+  serial had leaked into this changelog entry itself (three lines describing
+  the fix quoted the digits) -- replaced with a description, and the new
+  regression test above catches it in any tracked file, not just this one
+  (H1). The `_auto_park_pending` flag was never cleared on a SUCCESSFUL
+  park, so the next unrelated failure (e.g. a sweep) was silently eaten with
+  no modal at all -- fixed as described above (H2). Holding a key (arrow/
+  page) lost steps: the measured-position indicator (batch 3) reset the
+  slider -- and Manual Z, which the keyboard path reads as its move target
+  -- mid-sequence, so 8 presses could land at 5 µm instead of 8; the
+  indicator now skips both widgets while the slider has keyboard focus,
+  same guard already used for Manual Z while typing (H3). `editingFinished`
+  also fired on a plain Tab/focus-out with nothing typed, silently sending a
+  move to whatever the field showed; switched to `returnPressed` (Enter
+  only) (H4).
+
+### Tests
+
+Diagnostic test C10 retired from `xfail(strict)` to passing (its repro now
+starts from a known Z=0 baseline before the 5-PageUp check, since connecting
+already parks at 50 and the check is relative). `tests/diag/harness.py`:
+`App.__init__` sets a placeholder serial (no more hardcoded fallback for the
+scripts to fall back on) and `App.connect()` also waits for the park move to
+settle, so every script starts from the same idle state as before this
+batch; `c8_disconnect_freeze.py` shortens `MOVE_TIMEOUT_S` like
+`c3_position_lie.py` already did, so its `piezo_never_on_target` fault does
+not add 30 s to that wait. New unit tests: the slider's step actions and
+Manual Z's Enter each request a move with the settled value (drag and a
+burst of key presses included); the keyboard step updates both widgets and
+round-trips through `get_config`/`apply_saved_config`; the config schema
+accepts/rejects `keyboard_step_um`; `_apply_camera_params` sends both
+values; connecting requests the park move and a failed one logs a warning
+without a dialog, cleared by a user move; an empty serial is refused with
+the warning dialog and never reaches `connect_hardware`. After review: a
+new `tests/test_no_hardcoded_serial.py` walks every git-tracked file and
+fails if the real serial reappears anywhere (H1); a successful park clears
+`_auto_park_pending` so the next error is modal again, and starting a sweep
+clears it too (H2); an end-to-end test with a real (slowed) move reproduces
+8 held-key presses landing at the correct 8 µm, not 5 (H3); Manual Z's
+focus-loss-without-Enter no longer sends a move (H4).
+
+### Measured on the simulator
+
+No change to the continuous-preview or move-vs-camera figures (this batch
+touches the piezo path and the config only): 20-21 fps, ~120 ms order-to-
+image median, both perf-gate criteria still PASS.
+
+## Connect and disconnect without freezing the window (2026-09-22)
+
+Phase-2 batch 4 (fix 6 of the verified diagnosis: findings C8 and R9; the
+re-entrancy of C5 was already gone with batch 1).
+
+### Why
+
+- Connecting (opening the camera and the piezo, about 1.4 s estimated) and
+  disconnecting ran on the GUI thread. With a piezo that never reports it is
+  back at 0, a disconnect or the app's close froze the window for 10 s
+  (measured: 10.2 s, a 100 ms timer fired after 10.2 s); with a driver call
+  that does not answer it would be longer (7 s per read in the PI DLL).
+
+### What changed
+
+- `AcquisitionService.connect_hardware()` / `disconnect_hardware()` run the
+  connection on a Python daemon thread (never a QThread: a driver call that
+  never returns is left behind at exit instead of making Qt abort) and report
+  `connectFinished(ok)` / `disconnectFinished()`. One at a time
+  (`connection_busy()`); while one is in progress a second connect, a
+  disconnect, a sweep, a manual move and the camera (preview, snapshot) are
+  refused, so the camera owner is never created while the camera is being
+  opened or closed. A failed connect releases what was opened on the same
+  thread.
+- Panel: the button says "Connecting…" / "Disconnecting…" and everything is
+  frozen until the thread reports back; a second click does nothing; the
+  "Hardware connection failed" dialog stays (the user must act).
+- `disconnect_all`: the camera close is requested from the owner first and
+  waited for after the piezo is released, so both waits overlap (a hung
+  camera and a faulty piezo cost max(8, 10) s, not 18 s); a piezo that never
+  reports reaching 0 is warned about and its servo is still switched off (it
+  used to skip SVO/SVA); `park_timeout_s` and `cancel_flag` parameters.
+- After review: "Apply camera settings" (`connect_camera`) is refused by the
+  service itself while connecting/disconnecting (it would have set the
+  exposure from the GUI thread on a camera being opened or closed); a refused
+  `start_preview` never leaves the button on "Stop preview"; a connection
+  thread still running after `CONNECTION_STUCK_S` (20 s, above the longest
+  legitimate disconnect) gives the window back with "not answering", no new
+  connection starts while it lives, and whatever it opens when it finally
+  returns is released; the camera is not opened when the piezo already
+  failed.
+- App close (`shutdown`): a connect/disconnect in progress has its piezo wait
+  cancelled and is joined (bounded, 10 s; a thread stuck in a driver is left
+  alone and reported, never raced from a second thread); the final release
+  parks the piezo with a 2 s deadline (`CLOSE_PARK_TIMEOUT_S`) instead of
+  10 s. The camera keeps its 8 s deadline and `abandon()`.
+
+### Measured on the simulator
+
+Faulty piezo (never on target): the Disconnect click returns at once and a
+100 ms timer fires at 0.1 s, while the window shows "Disconnecting…" (the
+release itself still waits its 10 s, off the GUI thread); closing the app with
+the same piezo takes 2.1 s instead of 10+ s. Connect: the click returns at
+once and the window says "Connecting…".
+
+### Tests
+
+Diagnostic test C8 retired from `xfail(strict)` (now also checks connect,
+the frozen buttons, the ignored second click and the close); its wall-clock
+bounds only with `INTERFEROLAB_TIMING_TESTS`. New tests for the connection
+thread (non-blocking, refusals while busy, failed connect released on the
+thread, shutdown cutting a slow disconnect short, a stuck thread left alone),
+for `disconnect_all` (servo off after a park timeout, cancel, camera closed
+while the piezo parks) and for the panel states. Reproduction scripts and the
+smoke test wait for the connection thread (`App.disconnect()` in the harness).
+
+## Measured piezo position, followed live (2026-09-22)
+
+Phase-2 batch 3 (fix 5 of the verified diagnosis: findings C3, U3, U4).
+
+### Why
+
+- The window showed the TARGET as the "real" position: the app never read
+  the piezo (`qPOS`). After a failed move (no on-target within the timeout)
+  the stage had executed the MOV and sat at 60 µm while the slider said 0
+  (C3); a cancelled move showed the target it never reached (U4).
+- The position indicator jumped once at the end of a move and did not follow
+  it (U3); since batch 1 it no longer moved with the preview either, and
+  Miguel decided it must follow the piezo, with the measured position.
+
+### What changed
+
+- `AcquisitionSession._read_position` reads `qPOS` (NaN = unknown, never
+  raises). `_move_piezo` returns the measured position and reads it also
+  when the move fails or is cancelled, before raising; `connect_piezo` reads
+  the starting position. `_last_real_pos` (the preview frames' z) is now
+  always a measurement.
+- Live following: `move_to(..., position_cb=...)` reports `qPOS` on every
+  on-target poll after the first one, from the move thread (the only thread
+  on the piezo then: no query from the GUI). A healthy small step is on
+  target by the second poll, so it costs one query more than before (the
+  final one); a slow or failed move is followed every ~0.12 s.
+- Sweep: progress (and so the indicator) carries the measured z; the FILE
+  NAMES keep the commanded z as before, because the analysis reads z from
+  them and switching to the sensor reading would change results.
+- Panel: a "Measured Z" label (3 decimals; "unknown" when unreadable, never
+  drawn as 0); slider and Manual Z follow the measured position, but Manual
+  Z is not overwritten while it has the keyboard focus (the user may be
+  typing the next target during a followed move); corrected slider tooltip.
+
+- `_wait_on_target` polls at a fixed rate (100 ms from the start of one
+  poll to the next) instead of sleeping 100 ms after each query, so the
+  final `qPOS` comes out of the pause and moves are not longer than before.
+
+### Cost (simulator, default profile; GCS figures estimated)
+
+One `qPOS` is 20 ms (query + pipython's `ERR?`). With the extra read alone a
+1 µm manual move went from 153 to 173 ms and the perf gate lost one order of
+30 (the Move button stays disabled longer); with fixed-rate polling it is
+153 ms again and the gate is back to 28 own MOVs, 0 lost. Sweep steps keep
+their length for the same reason. The preview is untouched (the camera
+thread never queries the piezo).
+
+### Tests
+
+Diagnostic test C3 retired from `xfail(strict)` and extended: the window
+follows the stage live during a failed 1 s move and ends on the measured
+position. New unit tests: measured return value, one extra query per poll
+after the first, failed / cancelled / rejected moves report where the stage
+is, unreadable position is NaN, sweep file names vs measured progress,
+starting position at connection, panel label / NaN / focus guard. The smoke
+test compares the reported position with a tolerance (it is measured now).
+
+## Camera errors without modal dialogs; sweeps abort on a lost camera (2026-09-22)
+
+Phase-2 batch 2 (fix 2 of the verified diagnosis: findings C7, C4, C4b and
+C11), on top of the single camera-owner thread of batch 1.
+
+### Why
+
+- Any camera hiccup during the live preview (one lost frame, an SDK error)
+  stopped the preview and opened a modal "Acquisition error" dialog, often
+  **empty**: pylablib raises its frame timeout without a message (C7). While
+  focusing, the user had to close a blank dialog and restart the preview
+  without knowing why.
+- A sweep never gave up: a failed capture was skipped and the loop went on.
+  With the camera unplugged it walked all 501 positions (about 2 min); with a
+  camera that stays present but never delivers, each step paid the full
+  timeout (derived: about 47 min), for a dataset with no frames (C4, C4b).
+- A failing `qONT` counted as "on target" after a fixed wait, so a move whose
+  arrival could not be confirmed was treated as a success (C11).
+
+### What changed
+
+- Live preview and snapshot failures (arming failed, SDK error while
+  streaming, no frame within the timeout, snapshot failed) are **retried by
+  the camera thread**: the camera is disarmed, and re-armed after 1 s
+  (`CameraOwner.PREVIEW_RETRY_DELAY_S`; the pause never delays a stop, a
+  sweep or a close). Each failure is shown as a non-blocking notice in a
+  status line under the preview (`previewNotice` signal, `lbl_camera_status`),
+  with the real text; the notice clears when frames flow again. After 3
+  failures in a row (`PREVIEW_MAX_FAILURES`) the preview stops and the status
+  line says so. No dialog in any of these cases. The inner 3-attempt arming
+  loop of batch 1 is folded into this retry.
+- A failed exposure change is also a notice plus a log line, not a dialog:
+  the preview goes on, and every sweep sets and verifies its own exposure.
+- Error texts are never empty (`describe_error`): an exception without a
+  message is described by its type ("the camera did not deliver a frame in
+  time (ThorlabsTLCameraTimeoutError)"); the error dialog has a fallback text.
+- The sweep **aborts after 3 consecutive failed captures**
+  (`AcquisitionSession.SWEEP_MAX_CONSECUTIVE_FAILURES`); a lone failure is
+  still skipped as before, and a good frame resets the count. The partial
+  folder gets a `SWEEP_ABORTED.txt` (reason, frames saved, frames planned),
+  and the user gets one "Sweep aborted" dialog with the number of frames
+  saved (new `sweepAborted` signal before `finished`).
+- A full disk is treated like a lost camera: 3 failed saves in a row also
+  abort the sweep (separate count, same threshold).
+- After review: a failed arming no longer lets a pending snapshot spend the
+  next attempt without the 1 s pause; a failed exposure's notice clears when
+  an exposure is applied successfully (frames at the old exposure do not
+  clear it); a given-up snapshot says so ("Preview frame given up ...; the
+  live preview is stopped").
+- `_wait_on_target`: only GCS error 2 ("unknown command", a controller
+  without `qONT`) falls back to the settle-time wait; any other `qONT` error
+  is polled again, and 3 in a row fail the move ("Could not confirm that the
+  piezo reached its target").
+- Dialogs that stay, on purpose: failed hardware connection (nothing works
+  until the user acts), failed sweep and failed manual move (the stage may
+  not be where the window says), and the end-of-sweep "Incomplete dataset"
+  / "Sweep aborted" warnings (the dataset must not be analysed as if whole).
+- Simulator: new continuous-stream fault, off by default
+  (`faults.stream_stall_after_frames`, `faults.stream_stall_arms`; example in
+  `sim/profiles/faults_preview_stall.toml`), because the existing snap faults
+  never reach a camera that stays armed.
+
+### Measured on the simulator
+
+Camera unplugged mid-sweep (21 positions, 0.5 s timeout): 3 failed steps and
+abort in 1.8 s (was 19 failed steps, 4.3 s). Camera that never delivers
+(5 positions): abort after 3 steps, 3.4 s; for the default 501-step sweep
+with a 5 s timeout that is about 17 s instead of about 47 min (derived:
+3 x 5.6 s). A stalled stream is noticed after the timeout and re-armed; the
+preview resumes about 1.3 s after the notice.
+
+### Tests
+
+Diagnostic tests retired from `xfail(strict)` to passing: C4, C4b, C7, plus a
+new "never recovers" variant of C7; C7b now also checks the dialog text and
+that the piezo error leaves the camera status alone. New unit tests for the
+retry and give-up of the preview, the stop/close during the retry pause, the
+empty timeout message, the sweep abort and its marker file, the failure
+streak reset, the qONT confirmation (C11) and the non-modal status line.
+
+## Continuous live preview with a single camera-owner thread (2026-09-22)
+
+Phase-2 batch 1 (implementation of fixes 1 and 3 of the verified diagnosis,
+`_agentes/_trabajo/A4_verificacion.md`). Option 1a chosen by Miguel on
+2026-09-21: the preview is a continuous stream and exactly one thread uses
+the camera.
+
+### Why
+
+- Every preview frame paid a full `snap()`: pylablib arms the camera (an
+  85-frame, ~2.1 GB buffer), sleeps 0.05 s, triggers, waits, sleeps 0.2 s and
+  disarms. Measured on the simulator: 0.5 s per frame, 1.5 frames/s at best,
+  0.7-2.9 s from a piezo order to the image, and 90 % of manual moves refused
+  at the fastest preview interval because a capture was "in flight" (R1-R4,
+  R6, C6). The app and Qt cost 10-15 ms per frame: not the problem (R7).
+- pylablib has no lock around the SDK: disconnecting, reconnecting, applying
+  the exposure or closing the app while a capture was in flight put two
+  threads inside the camera object (C1, C1b, C5, C9), and a hung SDK call
+  made Qt abort the process at exit ("QThread: Destroyed while thread is
+  still running", C2).
+
+### What changed
+
+- New `backend/acquisition/camera_owner.py`: `CameraOwner`, a Python daemon
+  thread with a request queue that is the only user of the camera once it is
+  connected. It runs the live stream (camera armed ONCE in continuous mode,
+  small ring buffer, `wait_for_frame` + `read_newest_image` in a loop, Bayer
+  merge on that thread), one-shot snapshots (`snap()`) while the stream is
+  off, exposure changes (stream stopped, exposure set, stream re-armed), the
+  Z sweep (`run_sweep` unchanged, stream paused before and resumed after)
+  and the camera close. Orders record a *wanted* state that the thread
+  reconciles, so the last order always wins.
+- "Newest frame wins": the camera thread drops each frame into a one-slot
+  mailbox in the service and posts a single notification; a slow GUI skips
+  intermediate frames instead of queueing them.
+- Manual piezo moves never wait for the camera any more; an order arriving
+  during a move replaces the queued target (old steps are never replayed).
+  Preview frames no longer re-emit the set-point as a position, so the slider
+  and Manual Z stop snapping back while the user edits them.
+- `AcquisitionSession` gained the stream primitives (`stream_start`,
+  `stream_read`, `stream_stop`), `set_exposure`, `close_camera`, and creates
+  the owner on demand; `disconnect_all` closes the camera through the owner
+  with a deadline (`CAMERA_CLOSE_TIMEOUT_S`, 8 s). If a camera call never
+  returns, the thread is abandoned, the handle forgotten and the user told
+  ("Camera is not answering ..."); the abandoned thread cannot touch a camera
+  reconnected later (`abandon()` + the `_call` guard; `run_sweep` binds its
+  camera object once). `connect_camera` no longer arms the camera.
+- Service: the sweep, preview and move QThreads are replaced by the owner
+  thread plus one QThread per manual move (with the existing graveyard);
+  `start_preview()/stop_preview()` and `previewingChanged(bool)`; `start()`
+  no longer refuses a sweep during a preview (it queues behind it on the
+  same thread); `shutdown()` is bounded and never destroys a running thread.
+- Panel: the preview timer, the "Preview interval" spinbox and its Apply
+  button are gone (older `app_config.json` values are accepted and ignored);
+  "Start sweep" no longer spins the event loop waiting for a capture (no
+  re-entrant clicks); an error no longer switches the preview flag off: only
+  the camera thread does, through `previewingChanged`.
+
+### Measured on the simulator (default profile, offscreen)
+
+Before: 1.5 fps on screen, 719-756 ms median order-to-image, 18 of 20 moves
+refused. After: about 20-21 fps on screen (the simulator's own frame
+synthesis is the limit), order-to-image median about 120 ms, 0 moves refused.
+Figures and method in `_agentes/_trabajo/B1_nucleo.md`.
+
+### Tests
+
+New `tests/test_camera_owner.py` (single owner, stream, snapshot,
+exposure, sweep pause/resume, errors, abandoned camera) and new service tests
+(newest frame wins, moves during the stream, latest move wins, exposure and
+sweep through the owner, bounded shutdown). Diagnostic tests retired from
+`xfail(strict)` to passing: C1, C1b, C2, C5 (both), C6, C7b, C9, plus a new
+whole-session single-owner check; the reproduction scripts behind these
+tests now live in `tests/diag/`. `FakeCamera`/`FakeSession` extended with the
+continuous-acquisition surface. After review: an abandoned camera thread whose
+stuck call ends with an exception, or that was in the middle of a sweep, can
+no longer touch a camera or piezo reconnected later (`_call` guarded before
+and after, `abandon()` cancels the sweep); load-dependent assertions are only
+checked with `INTERFEROLAB_TIMING_TESTS` set.
+
+### To confirm in the lab
+
+Arming cost and memory with the 10-frame ring buffer; whether the stream
+keeps up at 21.7 fps on the lab PC (the mailbox drops frames if not); the
+SDK's behaviour of `set_exposure` on an armed camera is deliberately not
+relied on (the stream is stopped around it).
+
+## Hardware simulator (2026-09-21)
+
+**Why.** Lab access is now occasional, and the live preview (worst while moving
+the piezo) cannot be diagnosed or fixed without the hardware. `sim/` provides a
+simulator faithful enough to measure and fix it offline.
+
+- **The app is not modified.** `sim/fakes/` holds fake `pylablib` and `pipython`
+  packages with the exact API surface the app uses; `sim/run_simulated.py` puts
+  them first on `sys.path` and starts `main.py`. Without the launcher the app
+  imports the real libraries.
+- **It can never pass for the real thing**: `[SIMULATION]` window title and a
+  fixed red banner, `SIM-…` device serials in the log, output folders prefixed
+  `SIM_` with `simulated: true` metadata (pixels are not marked).
+  `interferolab.spec` and both `build_release` scripts exclude `sim/` and reject
+  a bundle that contains it.
+- **Four layers**: API; timing (a step-by-step replica of `pylablib` 1.4.5
+  `snap()` and the GCS round trips, every figure in `sim/profiles/default.toml`
+  labelled published / measured / derived / estimated); signal (white-light
+  fringes over a known surface, BGGR 12-bit mosaic, noise, saturation, ground
+  truth saved); injectable faults. Plus a replay mode over a real LP126CU stack.
+- **Gate**: `sim/compare_real_vs_sim.py` compares simulated against real
+  LP126CU stacks (59/59 checks). Most camera-SDK timings are still estimates.
+- **Lab probe**: `sim/lab_timing_probe.py`, packaged as its own executable
+  (`sim/lab_timing_probe.spec`), measures the missing timings on the real
+  hardware and writes a profile the simulator loads with `--profile`. The piezo
+  serial is read from the lab machine's `app_config.json`, never from the repo.
+- 48 new tests (367 total).
