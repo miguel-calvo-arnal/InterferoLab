@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -64,7 +65,18 @@ def _attach(session, camera=None, piezo=None):
 
 
 def _output_files(folder: str) -> list[str]:
-    return sorted(os.listdir(folder))
+    """Everything the sweep wrote except positions.csv (batch 6), which is
+    written for every sweep and has its own tests."""
+    return sorted(f for f in os.listdir(folder) if f != AcquisitionSession.POSITIONS_CSV)
+
+
+def _positions_rows(folder: str) -> list[dict]:
+    import csv
+
+    with open(
+        os.path.join(folder, AcquisitionSession.POSITIONS_CSV), newline="", encoding="utf-8"
+    ) as fh:
+        return list(csv.DictReader(fh))
 
 
 # ---------------------------------------------------------------------------
@@ -903,3 +915,123 @@ def test_disconnect_cancel_flag_cuts_the_park_wait(session, fast_poll):
     session.disconnect_all(park_timeout_s=30.0, cancel_flag=flag)
     assert piezo._polls == 0  # the wait ended before its first poll
     assert piezo.svo_calls == [("A", 0)] and piezo.closed
+
+
+# ---------------------------------------------------------------------------
+# positions.csv (batch 6)
+# ---------------------------------------------------------------------------
+def test_positions_csv_has_one_row_per_saved_frame_in_order(session, tmp_path):
+    """Header, one row per saved frame, in sweep order, with both z values."""
+    _, piezo = _attach(session)
+    piezo.position = 2.0345  # qPOS answers this for every step
+    folder = session.run_sweep(_base_cfg(tmp_path, end=2.0))
+
+    rows = _positions_rows(folder)
+    assert [r["index"] for r in rows] == ["0", "1", "2"]
+    assert [r["filename"] for r in rows] == _output_files(folder)
+    assert [r["z_commanded_um"] for r in rows] == ["0.0000", "1.0000", "2.0000"]
+    assert [r["z_measured_after_move_um"] for r in rows] == ["2.0345"] * 3
+    assert list(rows[0].keys()) == list(AcquisitionSession.POSITIONS_HEADER)
+    # timestamps are readable and ordered
+    stamps = [datetime.fromisoformat(r["timestamp"]) for r in rows]
+    assert stamps == sorted(stamps)
+    # the image files are exactly the ones the sweep always produced
+    assert _output_files(folder) == [
+        "piezo_0.0000um_0000.tiff",
+        "piezo_1.0000um_0001.tiff",
+        "piezo_2.0000um_0002.tiff",
+    ]
+
+
+def test_positions_csv_says_nan_when_the_position_cannot_be_read(session, tmp_path):
+    _, piezo = _attach(session)
+    piezo.position = GCSError(-3)  # qPOS fails: the measurement is unknown
+    folder = session.run_sweep(_base_cfg(tmp_path, end=1.0))
+    rows = _positions_rows(folder)
+    assert [r["z_measured_after_move_um"] for r in rows] == ["nan", "nan"]
+    assert [r["z_commanded_um"] for r in rows] == ["0.0000", "1.0000"]
+
+
+def test_positions_csv_skips_frames_that_were_not_saved(session, tmp_path):
+    """A failed capture leaves no file and no row (the csv matches the disk)."""
+    _attach(session, camera=FakeCamera(fail_snap_at=(1,)))
+    folder = session.run_sweep(_base_cfg(tmp_path, end=2.0))
+    rows = _positions_rows(folder)
+    assert [r["index"] for r in rows] == ["0", "2"]
+    assert [r["filename"] for r in rows] == _output_files(folder)
+
+
+def test_positions_csv_of_an_aborted_sweep_matches_the_marker(session, tmp_path):
+    """Batch 2 + 6: the csv keeps the frames that were saved before the abort."""
+    _attach(session, camera=FakeCamera(fail_snap_at=tuple(range(2, 100))))
+    folder = session.run_sweep(_base_cfg(tmp_path, end=9.0))
+    rows = _positions_rows(folder)
+    assert [r["index"] for r in rows] == ["0", "1"]
+    assert [r["filename"] for r in rows] == [
+        f for f in _output_files(folder) if f.startswith("piezo_")
+    ]
+    assert AcquisitionSession.ABORT_MARKER in _output_files(folder)
+    assert "2 of 10 frame(s) saved" in session.last_sweep_aborted
+    with open(os.path.join(folder, AcquisitionSession.ABORT_MARKER), encoding="utf-8") as fh:
+        assert f"frames_saved = {len(rows)}" in fh.read()
+
+
+def test_positions_csv_of_a_cancelled_sweep_keeps_what_was_saved(session, tmp_path):
+    _attach(session)
+    flag = CancelFlag()
+
+    def progress_cb(percent, z, done, total, elapsed, eta):
+        if done == 2:
+            flag.cancel()
+
+    folder = session.run_sweep(_base_cfg(tmp_path), progress_cb=progress_cb, cancel_flag=flag)
+    rows = _positions_rows(folder)
+    assert [r["index"] for r in rows] == ["0", "1"]
+    assert [r["filename"] for r in rows] == _output_files(folder)
+
+
+def test_positions_csv_is_written_as_the_sweep_goes(session, tmp_path):
+    """Nothing is kept in memory until the end: the row of a frame is on disk
+    before the next frame is captured (checked from the camera's snap())."""
+    seen: list[int] = []
+    cam = FakeCamera()
+    orig = cam.snap
+
+    def counting_snap(timeout=None):
+        folder = getattr(session, "_test_folder", None)
+        if folder is not None:
+            seen.append(len(_positions_rows(folder)))
+        return orig(timeout)
+
+    cam.snap = counting_snap
+    _attach(session, camera=cam)
+    real_create = AcquisitionSession.create_output_folder
+
+    def create_output_folder(base_folder, log_cb):
+        folder = real_create(base_folder, log_cb)
+        session._test_folder = folder
+        return folder
+
+    session.create_output_folder = staticmethod(create_output_folder)
+    folder = session.run_sweep(_base_cfg(tmp_path, end=3.0))
+    # one row already flushed before each capture but the first
+    assert seen == [0, 1, 2, 3]
+    assert len(_positions_rows(folder)) == 4
+
+
+def test_positions_csv_failure_never_stops_the_sweep(session, tmp_path, monkeypatch):
+    """A folder that cannot take the csv: warned once, the sweep goes on."""
+    _attach(session)
+    real_open = open
+
+    def failing_open(path, *a, **k):
+        if str(path).endswith(AcquisitionSession.POSITIONS_CSV):
+            raise OSError("read-only file system")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    log = LogCollector()
+    folder = session.run_sweep(_base_cfg(tmp_path, end=1.0), log_cb=log)
+    assert log.contains("Could not write positions.csv", level="warn")
+    assert len(_output_files(folder)) == 2
+    assert log.contains("Sweep finished", level="info")

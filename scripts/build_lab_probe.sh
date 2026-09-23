@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the STANDALONE lab timing probe (Linux): dist/lab_timing_probe/lab_timing_probe
-# Usage: sim/build_lab_probe.sh [--distpath DIR] [--workpath DIR]
+# Usage: scripts/build_lab_probe.sh [--distpath DIR] [--workpath DIR]
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"

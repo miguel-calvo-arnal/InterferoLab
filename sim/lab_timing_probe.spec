@@ -4,8 +4,8 @@
 # STANDALONE lab timing probe: lab_timing_probe[.exe] for the lab PC, which
 # only runs packaged executables (no repo, no Python there).
 #
-#   Windows VM :  sim\build_lab_probe.bat      -> dist\win\lab_timing_probe\
-#   Linux      :  sim/build_lab_probe.sh       -> dist/lab_timing_probe/
+#   Windows VM :  scripts\build_lab_probe.bat      -> dist\win\lab_timing_probe\
+#   Linux      :  scripts/build_lab_probe.sh       -> dist/lab_timing_probe/
 #
 # Same hardware dependencies as InterferoLab (see interferolab.spec):
 #   * PI E-625 through E816_DLL_x64.dll: bundled from API/PI/ into API/PI/

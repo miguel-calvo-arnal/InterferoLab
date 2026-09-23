@@ -48,3 +48,7 @@ docs/Quantum efficiency and IR filter/IR filter transmission.png
 
 # Agent team workspace (project management, Spanish, local only)
 _agentes/
+
+# Guía personal del día de laboratorio (lleva el serial del piezo): fuera del repo
+GUIA_LABORATORIO.md
+GUIA_LABORATORIO.pdf

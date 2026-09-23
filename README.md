@@ -108,6 +108,17 @@ prerequisites: `backend/analysis/compile_notes.txt`.
   sweep scans Z between the two with the configured step.
 - Datasets are saved to `data/<timestamp>/`; analysis writes to
   `output/<name>_M<method>/`.
+- Every sweep also writes `positions.csv` in its dataset folder, one row per
+  SAVED frame, as the sweep goes: `index`, `filename`, `z_commanded_um`,
+  `z_measured_after_move_um` and `timestamp` (local, milliseconds). It is a
+  record to check a sweep with (and to see what a partial dataset contains:
+  a sweep that stops early leaves the rows of the frames it did save, next to
+  `SWEEP_ABORTED.txt`). **The measured z is read from the controller when the
+  move ends, before the exposure — not while the frame is being taken — so it
+  is not a per-frame z for the reconstruction**, which still takes z from the
+  file names (the commanded positions). `nan` means the position could not be
+  read. In open loop (not reachable from the window) the two z columns are the
+  commanded voltage and the measured voltage instead.
 - Noise analysis of a flat reference surface:
   `python scripts/flat_noise_analysis.py output/<dataset>/<dataset>_height.npy`
   (see the script's docstring for how to read its outputs).

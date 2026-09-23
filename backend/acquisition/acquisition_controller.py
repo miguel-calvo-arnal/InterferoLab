@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
+import csv
+import math
 import os
 import threading
 import time
@@ -94,6 +97,20 @@ class AcquisitionSession:
     # File written into the output folder of an aborted sweep, so the partial
     # dataset is recognisable later without the log.
     ABORT_MARKER: str = "SWEEP_ABORTED.txt"
+
+    # One row per SAVED frame, written as the sweep goes (never kept in
+    # memory): index, image file, commanded z, measured z, timestamp.
+    POSITIONS_CSV: str = "positions.csv"
+    POSITIONS_HEADER: tuple[str, ...] = (
+        "index",
+        "filename",
+        "z_commanded_um",
+        # Read with qPOS when the MOVE ENDS, before the exposure, not while
+        # the frame is being taken: good enough to check the sweep, NOT a
+        # per-frame z for the reconstruction (see README.md).
+        "z_measured_after_move_um",
+        "timestamp",
+    )
 
     # Consecutive qONT errors tolerated while waiting for the piezo; a move
     # whose arrival cannot be confirmed is a failure, not a success (C11).
@@ -701,6 +718,7 @@ class AcquisitionSession:
         """
         Perform Z-sweep.
         """
+        positions_file = None
         try:
             # -------- VALIDATION --------
             if self._piezo is None or self._camera is None:
@@ -774,6 +792,7 @@ class AcquisitionSession:
 
             # -------- OUTPUT FOLDER --------
             output_folder = self.create_output_folder(base_output, log_cb)
+            positions_file, positions_csv = self._open_positions_csv(output_folder, log_cb)
 
             n_steps = max(1, int(round((end - start) / step)) + 1)
             positions = np.linspace(start, end, n_steps)
@@ -820,6 +839,7 @@ class AcquisitionSession:
                     # copy=False: snap() already returns uint16 on this camera,
                     # so avoid duplicating the full-resolution frame (O-3).
                     raw = np.asarray(cam.snap(timeout=timeout)).astype(np.uint16, copy=False)
+                    t_frame = datetime.now()
                 except Exception as e:
                     skipped_frames += 1
                     consecutive_failures += 1
@@ -874,6 +894,19 @@ class AcquisitionSession:
                             raise RuntimeError("cv2.imwrite returned False")
                     saved_frames += 1
                     consecutive_save_failures = 0
+                    # One row per saved frame, flushed immediately: an
+                    # aborted or cancelled sweep leaves a csv that matches
+                    # the files on disk.
+                    self._write_position_row(
+                        positions_file,
+                        positions_csv,
+                        idx,
+                        filename,
+                        z,
+                        real_pos,
+                        t_frame,
+                        log_cb,
+                    )
 
                 except Exception as e:
                     save_errors += 1
@@ -957,6 +990,58 @@ class AcquisitionSession:
             if log_cb:
                 log_cb("error", msg)
             raise
+        finally:
+            if positions_file is not None:
+                with contextlib.suppress(Exception):
+                    positions_file.close()
+
+    def _open_positions_csv(self, folder: str, log_cb: LogCallback | None):
+        """Open <folder>/positions.csv and write its header.
+
+        Returns (file, csv.writer), or (None, None) if it cannot be opened:
+        the log of the positions must never stop a sweep.
+        """
+        try:
+            fh = open(  # noqa: SIM115 - closed in run_sweep's finally
+                os.path.join(folder, self.POSITIONS_CSV), "w", newline="", encoding="utf-8"
+            )
+            writer = csv.writer(fh)
+            writer.writerow(self.POSITIONS_HEADER)
+            fh.flush()
+        except OSError as e:
+            if log_cb:
+                log_cb("warn", f"Could not write {self.POSITIONS_CSV}: {describe_error(e)}")
+            return None, None
+        return fh, writer
+
+    def _write_position_row(
+        self,
+        fh,
+        writer,
+        idx: int,
+        filename: str,
+        z_commanded: float,
+        z_measured: float,
+        when: datetime,
+        log_cb: LogCallback | None,
+    ) -> None:
+        """Append one row and flush it (a few µs; the frame is already saved)."""
+        if writer is None:
+            return
+        try:
+            writer.writerow(
+                [
+                    idx,
+                    filename,
+                    f"{z_commanded:.4f}",
+                    "nan" if math.isnan(z_measured) else f"{z_measured:.4f}",
+                    when.isoformat(timespec="milliseconds"),
+                ]
+            )
+            fh.flush()
+        except (OSError, ValueError) as e:
+            if log_cb:
+                log_cb("warn", f"Could not append to {self.POSITIONS_CSV}: {describe_error(e)}")
 
     def _write_abort_marker(
         self,

@@ -60,9 +60,9 @@ standalone program, built from `sim/lab_timing_probe.spec`. It is not part of th
 bundle, and it never contains the simulator: a guard in its spec aborts the build if anything
 from `sim/fakes` or `sim.*` gets in.
 
-1. **Build it (one step).** On the Windows VM, double-click `sim\build_lab_probe.bat`. It needs the
+1. **Build it (one step).** On the Windows VM, double-click `scripts\build_lab_probe.bat`. It needs the
    same `.venv\` or `.venv-win\` as `scripts\build_release.bat` and `API\PI\E816_DLL_x64.dll`
-   in the repo. The result is `dist\win\lab_timing_probe\`. On Linux, `sim/build_lab_probe.sh`
+   in the repo. The result is `dist\win\lab_timing_probe\`. On Linux, `scripts/build_lab_probe.sh`
    writes to `dist/lab_timing_probe/`.
 2. **Run it at the instrument.** Copy the whole `lab_timing_probe` folder to the lab PC, close
    InterferoLab, and double-click `lab_timing_probe.exe`. It takes about 6-10 min. Use

@@ -87,7 +87,8 @@ def test_superpixel_sweep_feeds_analysis_backend(in_tmp_cwd, tmp_path, synthetic
     heights, low_mask, high_mask, targets, raw = synthetic_bayer_frames
     folder = _run_sweep(tmp_path, fmt, raw)
 
-    files = sorted(os.listdir(folder))
+    # positions.csv (batch 6) is written by every sweep; the images are these
+    files = sorted(f for f in os.listdir(folder) if f.endswith("." + fmt))
     assert len(files) == hb.NZ
     assert all(f.endswith("." + fmt) for f in files)
 

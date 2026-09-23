@@ -504,6 +504,51 @@ binned mono merge.
 **Data taken on 2026-09-08 is affected**: colour stacks have R and B swapped,
 and mono stacks were merged with the red and blue weights exchanged.
 
+## A positions.csv next to every sweep (2026-09-23)
+
+Phase-2 batch 6 (asked for by Miguel).
+
+### Why
+
+The dataset folder said nothing about what actually happened during the
+sweep: the file names carry the COMMANDED z (the analysis reads it from
+there) and the measured position only existed in the window. A partial
+dataset (batch 2) was recognisable but not readable: which frames did it
+have, and where was the stage?
+
+### What changed
+
+- Every sweep writes `positions.csv` in its dataset folder: a header plus one
+  row per SAVED frame — `index`, `filename`, `z_commanded_um`,
+  `z_measured_after_move_um` (`nan` when the position could not be read) and
+  `timestamp` (local, milliseconds, taken when the frame came out of the
+  camera).
+- Written as the sweep goes and flushed per row (measured: 2 µs median per
+  row, 1.1 ms for a whole 501-step sweep), never kept in memory: a sweep that
+  aborts or is cancelled leaves the rows of the frames it did save, matching
+  the files on disk and the counters in `SWEEP_ABORTED.txt`. A frame that was
+  not saved (failed capture, failed save) has no row.
+- The images, their names and their contents are exactly what they were; the
+  csv is a record, not an input to the analysis. `README.md` (and the column
+  name) say that the measured z is read when the MOVE ENDS, before the
+  exposure, so it is not a per-frame z for the reconstruction.
+- A folder that cannot take the csv (read-only, full) is warned about once
+  and the sweep goes on.
+
+### Tests
+
+Content and order of the rows, the unknown-position case, frames that were
+not saved, an aborted sweep (csv consistent with `SWEEP_ABORTED.txt`), a
+cancelled one, proof that each row is on disk before the next frame is
+captured, and a csv that cannot be opened. Two existing tests that counted
+every file in the folder now count the images.
+
+### Unrelated fix
+
+`tests/test_no_hardcoded_serial.py` (batch 5) failed on every run: the guard
+flagged itself, because the serial it searches for was a literal in that same
+tracked file. It is now assembled from pieces.
+
 ## Keyboard piezo moves, fine step, camera timeout apply, park on connect (2026-09-22)
 
 Phase-2 batch 5 (fix 4/8/9 of the verified diagnosis: findings U1/C10, U8,
