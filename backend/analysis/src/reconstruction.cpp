@@ -765,10 +765,60 @@ static std::vector<float> parse_positions_from_filenames(
 // ============================================================================
 // find_envelope_peak()
 // ---------------------------------------------------------------------------
-// Returns the physical position corresponding to the maximum of `weights`.
-// Used by methods where the coherence envelope is asymmetric, making the
-// weighted centroid drift away from the true peak (e.g. Method 3 with a
-// broadband halogen source whose spectral asymmetry skews the envelope tail).
+// Returns the physical position of the maximum of `weights`, refined to
+// sub-step precision by fitting a parabola through the maximum and its two
+// neighbours.  Used by methods where the coherence envelope is asymmetric,
+// making the weighted centroid drift away from the true peak (e.g. Method 3
+// with a broadband halogen source whose spectral asymmetry skews the tail).
+//
+// WHY THE PARABOLA (September 2026)
+// ---------------------------------
+// Returning positions[idx_max] quantises every height to the scan grid, which
+// adds an irreducible uniform error of ±Δz/2, i.e. an rms floor of
+// Δz/√12 = 5.8 nm at Δz = 20 nm (8.7 nm at 30 nm).  That floor was large
+// enough to dominate the published S_q of Method 3 (8.1 nm on the 2026b
+// dataset contains 5.8 nm of pure quantisation) and to produce the "multiple
+// peaks" in its height histogram, which are simply the Δz levels.  Measured on
+// the synthetic bench (scripts/method_accuracy_bench.py), dispersion of the
+// height error: 5.78 nm with the discrete locator, 0.23 nm with the parabola
+// (0.34 nm on the skewed envelope of the "asym" case).
+//
+// BIAS ON AN ASYMMETRIC ENVELOPE  (known, accepted, documented)
+// -------------------------------------------------------------
+// A parabola is symmetric, so fitting it to three samples of a SKEWED envelope
+// pulls the vertex towards the wider side.  The real coherence envelope IS
+// skewed: the red channel of the halogen source has a much longer coherence
+// length than green and blue, which leaves a tail on one side.  The
+// refinement therefore trades a random error (quantisation) for a partly
+// systematic one, and Miguel accepted the change knowing that.
+//
+// How large it is, measured (split-normal envelope, trailing side k times
+// wider; scripts/method_accuracy_bench.py "asym" case and the sweep in
+// _agentes/_trabajo/C1_backend.md):
+//
+//   k          1.0    1.2    1.4    1.6    2.0    2.5    3.0
+//   discrete  -0.7   +39.3  +73.3 +103.6 +154.3 +204.6 +245.8  nm
+//   parabola  -0.1   +39.5  +73.6 +103.6 +154.0 +204.5 +245.5  nm
+//
+// So the tens-of-nanometre offset is NOT the price of the refinement: the
+// discrete locator already returned it.  It is produced by the ENVELOPE
+// SMOOTHING (cfg::ENVELOPE_SIGMA = 15 samples) acting on a skewed envelope —
+// a symmetric Gaussian filter drags the maximum of an asymmetric curve
+// towards its wide side.  Measured separately (report C3 §3): the maximum of
+// the kernel's own, unsmoothed envelope is only −16 / −35 / −43 nm off for
+// k = 1.6 / 2.5 / 3.5, and after the σ_e = 15 smoothing it becomes
+// −100 / −200 / −276 nm, which is what the backend reports.  The bias is
+// therefore shared with Method 1 (same smoothing) and is reduced by lowering
+// σ_e, not by changing the peak locator.  What the parabola ADDS on top is
+// below 0.5 nm for k from 1 to 5, with and without noise, while it removes
+// the 5.8 nm of quantisation.  And an offset common to every pixel cancels in
+// the quantity this instrument actually measures, which is height DIFFERENCES
+// within one field; it does not cancel in an absolute height, which is
+// uncalibrated anyway, nor between materials whose spectra differ.
+//
+// The refinement is skipped when the maximum sits on either end of the scan,
+// or when the three samples are not concave (which a flat or noise-dominated
+// envelope can produce): in those cases the discrete position is returned.
 // ============================================================================
 [[nodiscard]] static float find_envelope_peak(
     const std::vector<float> &weights,
@@ -792,7 +842,35 @@ static std::vector<float> parse_positions_from_filenames(
     // which skewed the statistics of the representative pixels (B-15).
     if (max_val <= 0.0f)
         return positions[static_cast<size_t>(N / 2)];
-    return positions[static_cast<size_t>(idx_max)];
+
+    const float z_peak = positions[static_cast<size_t>(idx_max)];
+    if (idx_max == 0 || idx_max == N - 1)
+        return z_peak; // no neighbour on one side: nothing to interpolate
+
+    // Parabola through (−1, y0), (0, y1), (+1, y2) in SAMPLE units:
+    //   vertex offset  δ = ½ (y0 − y2) / (y0 − 2y1 + y2)
+    // The denominator is the (negative) second difference; it is < 0 for a
+    // genuine maximum.  A non-negative value means the three samples are not
+    // concave (plateau, or two equal maxima) and δ would be meaningless.
+    const double y0  = double(weights[static_cast<size_t>(idx_max - 1)]);
+    const double y1  = double(weights[static_cast<size_t>(idx_max)]);
+    const double y2  = double(weights[static_cast<size_t>(idx_max + 1)]);
+    const double den = y0 - 2.0 * y1 + y2;
+    if (den >= 0.0)
+        return z_peak;
+
+    double delta = 0.5 * (y0 - y2) / den;
+    // |δ| ≤ ½ by construction for a true interior maximum; clamp against
+    // round-off on a nearly degenerate parabola so the height can never leave
+    // the half-step around the sample it came from.
+    delta = std::clamp(delta, -0.5, 0.5);
+
+    // Convert the offset from samples to physical units with the LOCAL step.
+    // positions_sorted is ascending; the half-difference of the neighbours is
+    // the step even if the scan is not perfectly uniform.
+    const double step = 0.5 * (double(positions[static_cast<size_t>(idx_max + 1)])
+                             - double(positions[static_cast<size_t>(idx_max - 1)]));
+    return float(double(z_peak) + delta * step);
 }
 
 // ============================================================================
@@ -849,7 +927,8 @@ static void compute_envelope(
         // At α = π/2 (Schwider-Hariharan) this reduces to the standard kernel
         // (up to a 1/4 scale factor that cancels in the centroid).
         //
-        // With δz = 20 nm and λ₀ ≈ 550 nm: α ≈ 0.457 rad (≈ 26°).
+        // With δz = 20 nm and λ₀ = 570 nm (cfg::LAMBDA0_NM): α ≈ 0.441 rad
+        // (≈ 25°).
         // The un-normalised S-H kernel at this α gives E ∝ Γ·sin(α)·
         // sqrt(sin²φ + sin²α·cos²φ), which has residual fringe ripple
         // because sin²α ≠ 1.  The normalised version eliminates this ripple.
@@ -880,31 +959,54 @@ static void compute_envelope(
     {
         // Frequency-domain group-delay estimator (de Groot & Deck 1995).
         //
-        // Per-bin phase-difference approach: for each adjacent pair (k, k+1)
-        // compute the cross-product phase
+        // The envelope position n_peak appears as a linear phase ramp across
+        // the spectrum, so each adjacent pair of bins carries the same step
         //
-        //   step(k) = arg( FFT[k+1] * conj(FFT[k]) )
-        //           ≈ -2π n_peak / Nz
+        //   step ≈ -2π n_peak / Nz  =  arg( FFT[k+1] · conj(FFT[k]) )
         //
-        // atan2 constrains each step to (-π, π) with no sequential
-        // unwrapping.  This eliminates the instability that the old
-        // unwrapper had when n_peak ≈ Nz/2 (per-bin step ≈ ±π, right on
-        // the wrapping boundary).  Multiple pairs are averaged with
-        // amplitude weights, so a single noisy bin cannot corrupt the
-        // whole estimate.
+        // VECTOR AVERAGE (September 2026).  The estimate is the ARGUMENT OF
+        // THE SUM of the cross products,
+        //
+        //   step = arg( Σ_k FFT[k+1] · conj(FFT[k]) )
+        //
+        // and not, as before, the amplitude-weighted mean of the individual
+        // arg() values.  Averaging angles is wrong for two measured reasons
+        // (report D1-12, 23-Sep-2026):
+        //
+        //   1. SINGULARITY AT n_peak = Nz/2.  There the true step is exactly
+        //      ±π, so atan2 returns +π for some bins and -π for others.  The
+        //      arithmetic mean of the two branches is ≈ 0, which places the
+        //      surface at the bottom of the scan: an error of Nz·Δz/2 (2.7 µm
+        //      on a 300-frame, 20 nm scan).  A sum of complex numbers has no
+        //      branch to choose: the two ±π contributions add coherently and
+        //      the argument of the total is π, the correct answer.
+        //   2. NOISE.  The band half-width dk/2 comes from the second moment
+        //      of the whole amplitude spectrum, which the noise floor inflates
+        //      (on a real stack, 315 bins around a peak only ~12 bins wide).
+        //      Averaging angles gives every one of those empty bins a vote
+        //      whose weight is |FFT[k]| — small, but its angle is uniformly
+        //      random.  In the vector sum each bin contributes a vector of
+        //      length |FFT[k+1]|·|FFT[k]|, so the noise bins contribute
+        //      quadratically less and cancel against each other instead.
+        //
+        // Measured on the synthetic bench (scripts/method_accuracy_bench.py),
+        // height error dispersion: 0.85 nm clean / 8.9 nm with 5 % noise /
+        // 8.6 nm at n_peak = Nz/2, against 88.5 / 807.6 / 2327.2 nm for the
+        // mean of angles.  (The 0.85 nm floor of the clean case is not the
+        // estimator: peak_f is turned into a two-sample pseudo-envelope which
+        // is then smoothed and centroided, and the truncation of the ±2σ
+        // centroid window moves the result by up to ~1.7 nm.  Report C3 §2.)
+        // The cost is identical (the same loop, without the atan2 per bin).
         //
         // Correction for n_peak > Nz/2: the true step then lies in
         // (-2π, -π), atan2 returns step + 2π > 0, yielding peak_f < 0;
         // adding Nz restores the correct index.
         //
-        // The wider band (dk/2 instead of dk/4) is safe because individual
-        // steps are always in (-π, π) regardless of total phase range.
-        //
         // Rectangular window (no tapering): maximises frequency resolution,
         // keeping the coherence peak confined to its natural bin width (≈1-3
-        // bins).  Amplitude weighting already down-weights leakage-polluted
-        // low-energy bins, providing the same leakage immunity as Hann without
-        // broadening the main lobe.
+        // bins).  The |FFT[k+1]|·|FFT[k]| weighting implicit in the vector sum
+        // already down-weights leakage-polluted low-energy bins, providing the
+        // same leakage immunity as Hann without broadening the main lobe.
         hilb.forward_fft(signal, fbuf);
 
         const int half_bw = (dk > 0)
@@ -914,29 +1016,28 @@ static void compute_envelope(
         const int k_hi = (k_avg > 0) ? std::min(Nz / 2 - 1, k_avg + half_bw)
                                       : std::min(Nz / 2 - 1, half_bw);
 
-        double sum_w = 0.0, sum_wstep = 0.0;
+        // Accumulate the cross products themselves (double precision: the
+        // products of two float spectra of a 12-bit, Nz-sample signal reach
+        // ~1e13 and hundreds of them are summed).
+        double sum_re = 0.0, sum_im = 0.0;
         for (int k = k_lo; k < k_hi; ++k)
         {
-            const float re_cross = fbuf[k + 1][0] * fbuf[k][0]
-                                 + fbuf[k + 1][1] * fbuf[k][1];
-            const float im_cross = fbuf[k + 1][1] * fbuf[k][0]
-                                 - fbuf[k + 1][0] * fbuf[k][1];
-            const float step = std::atan2(im_cross, re_cross);
-            const float w    = std::sqrt(fbuf[k][0] * fbuf[k][0]
-                                       + fbuf[k][1] * fbuf[k][1]);
-            sum_w    += double(w);
-            sum_wstep += double(w) * double(step);
+            const double a_re = double(fbuf[k][0]),     a_im = double(fbuf[k][1]);
+            const double b_re = double(fbuf[k + 1][0]), b_im = double(fbuf[k + 1][1]);
+            sum_re += b_re * a_re + b_im * a_im;   // Re( X[k+1] · conj(X[k]) )
+            sum_im += b_im * a_re - b_re * a_im;   // Im( X[k+1] · conj(X[k]) )
         }
 
-        // Fallback for signal-free/saturated pixels (all in-band bins empty):
-        // place the pseudo-envelope at the CENTRE of the scan so the final
-        // height is positions[Nz/2], consistent with the fallbacks of the
-        // centroid and peak locators (B-15).  The previous value (peak_f = 0)
-        // pinned such pixels to the bottom of the Z-range.
+        // Fallback for signal-free/saturated pixels (all in-band bins empty,
+        // so the resultant vector vanishes): place the pseudo-envelope at the
+        // CENTRE of the scan so the final height is positions[Nz/2],
+        // consistent with the fallbacks of the centroid and peak locators
+        // (B-15).  The previous value (peak_f = 0) pinned such pixels to the
+        // bottom of the Z-range.
         float peak_f = 0.5f * float(Nz);
-        if (sum_w > 1e-30)
+        if (std::abs(sum_re) > 1e-30 || std::abs(sum_im) > 1e-30)
         {
-            const float m = float(sum_wstep / sum_w);
+            const float m = float(std::atan2(sum_im, sum_re));
             peak_f = -m * float(Nz) / float(2.0 * M_PI);
             if (peak_f < 0.0f)
                 peak_f += float(Nz);
@@ -1352,38 +1453,63 @@ cv::Mat reconstruct_height_map_rowchunks(
         }
 
         // ------------------------------------------------------------
-        // A2. ESTIMATE GLOBAL BANDPASS (Method 2, first chunk only)
-        // Sample up to 256 pixel Z-traces from the just-read chunk, average
-        // their amplitude spectra, and derive a single {k_avg, dk} that is
-        // applied to every pixel for the rest of the reconstruction.
+        // A2. ESTIMATE GLOBAL BANDPASS (Methods 2 and 4, first chunk only)
+        // Sample pixel Z-traces from the just-read chunk, average their
+        // amplitude spectra, and derive a single {k_avg, dk} that is applied
+        // to every pixel for the rest of the reconstruction.
+        //
+        // THE SAMPLE IS A FIXED GRID (September 2026).  It used to be "256
+        // pixels of the first chunk, stride (R·Nx)/256", and R is decided by
+        // auto_row_chunk() from the free RAM of the moment.  Because this one
+        // pair {k_avg, dk} is then shared by EVERY pixel, a machine with a
+        // different amount of free memory reconstructed a different height
+        // map: measured on data/S1F1 by faking /proc/meminfo, one bin of dk
+        // moved 99.95 % of the Method 2 heights (std 1.4 nm, max 22.7 nm).
+        // The grid below spans BAND_SAMPLE_ROWS rows — the floor that
+        // auto_row_chunk() always delivers — by BAND_SAMPLE_COLS columns
+        // across the full width, so it does not depend on R, on the free RAM,
+        // or on how the image happens to be split into chunks.  See the
+        // comment on cfg::BAND_SAMPLE_ROWS for why a band of rows samples the
+        // amplitude spectrum just as well as a scattered set.
         // ------------------------------------------------------------
         if (method_info->needs_global_params && global_k_avg < 0)
         {
-            const int n_sample = std::min(256, R * Nx);
-            const int step = std::max(1, (R * Nx) / n_sample);
+            // Rows guaranteed to be in this first chunk whatever the RAM
+            // (auto_row_chunk never returns fewer than 16 rows, nor more
+            // than Ny; R is further clamped to the rows left in the image).
+            const int rows_s = std::min(R, cfg::BAND_SAMPLE_ROWS);
+            const int cols_s = std::min(Nx, cfg::BAND_SAMPLE_COLS);
+            const int n_sample = rows_s * cols_s;
+
             std::vector<std::vector<float>> sample_signals;
             sample_signals.reserve(static_cast<size_t>(n_sample));
             std::vector<float> sig(static_cast<size_t>(Nz));
             std::vector<float> sample_baseline;
-            for (int idx = 0; idx < R * Nx && (int)sample_signals.size() < n_sample; idx += step)
+            for (int iy = 0; iy < rows_s; ++iy)
             {
-                const int r = idx / Nx, x = idx % Nx;
-                for (int z = 0; z < Nz; ++z)
-                    sig[static_cast<size_t>(z)] = chunk[idx3(z, r, x, R, Nx)];
-
-                // Methods that reconstruct from the baseline-subtracted signal
-                // (needs_baseline_removal, e.g. Method 4) must estimate the
-                // bandpass on that same signal.  Estimating on the raw signal
-                // let a strong DC drift anchor the argmax at k=1..3, shifting
-                // the band for the whole image (B-14).  Method 2 keeps the raw
-                // estimate by design: its bandpass zeros DC itself.
-                if (method_info->needs_baseline_removal)
+                for (int ix = 0; ix < cols_s; ++ix)
                 {
-                    gaussian_apply(sig, baseline_kernel, sample_baseline);
+                    // Cell centres of the grid: never the very first/last
+                    // column, and evenly spread whatever Nx is.
+                    const int r = iy;
+                    const int x = ((2 * ix + 1) * Nx) / (2 * cols_s);
                     for (int z = 0; z < Nz; ++z)
-                        sig[static_cast<size_t>(z)] -= sample_baseline[static_cast<size_t>(z)];
+                        sig[static_cast<size_t>(z)] = chunk[idx3(z, r, x, R, Nx)];
+
+                    // Methods that reconstruct from the baseline-subtracted signal
+                    // (needs_baseline_removal, e.g. Method 4) must estimate the
+                    // bandpass on that same signal.  Estimating on the raw signal
+                    // let a strong DC drift anchor the argmax at k=1..3, shifting
+                    // the band for the whole image (B-14).  Method 2 keeps the raw
+                    // estimate by design: its bandpass zeros DC itself.
+                    if (method_info->needs_baseline_removal)
+                    {
+                        gaussian_apply(sig, baseline_kernel, sample_baseline);
+                        for (int z = 0; z < Nz; ++z)
+                            sig[static_cast<size_t>(z)] -= sample_baseline[static_cast<size_t>(z)];
+                    }
+                    sample_signals.push_back(sig);
                 }
-                sample_signals.push_back(sig);
             }
             HilbertEnvelope::ComplexBuf tmp_buf;
             std::tie(global_k_avg, global_dk) =

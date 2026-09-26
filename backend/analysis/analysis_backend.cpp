@@ -111,6 +111,11 @@ static py::dict run_analysis_py(const std::string &dataset_folder,
     result["output_folder"] = paths.output_folder;
     result["heightmap"] = paths.heightmap_npy;
     result["cancelled"] = paths.output_folder.empty();
+    // Global bandpass of Methods 2 and 4 (-1 for 1 and 3).  It is the only
+    // number the whole image shares, so it is what a caller compares to check
+    // that two runs of the same dataset were really the same analysis.
+    result["k_avg"] = paths.k_avg;
+    result["dk"] = paths.dk;
     return result;
 }
 
@@ -152,7 +157,10 @@ PYBIND11_MODULE(analysis_backend, m)
 
             Returns a dict with keys:
               'output_folder' (str), 'heightmap' (str) — empty when cancelled —
-              and 'cancelled' (bool).
+              'cancelled' (bool), and 'k_avg' / 'dk' (int): the global bandpass
+              Methods 2 and 4 applied to every pixel, or -1 for Methods 1 and 3
+              (which have none).  Two runs of the same dataset must report the
+              same pair; see cfg::BAND_SAMPLE_ROWS in config.hpp.
         )doc");
 
     m.def(

@@ -74,6 +74,15 @@ struct AnalysisResultPaths
 
     /// Height map stored as .npy, e.g. "output/.../_height.npy"
     std::string heightmap_npy;
+
+    /// Global bandpass actually used by Methods 2 and 4 (-1 for Methods 1 and
+    /// 3, which do not have one).  These two integers are shared by every
+    /// pixel of the image, so they are the single value of the reconstruction
+    /// that is not computed per pixel; reporting them lets a caller check that
+    /// two runs of the same dataset really did the same thing.  See
+    /// cfg::BAND_SAMPLE_ROWS for why that used to depend on the free RAM.
+    int k_avg = -1;
+    int dk    = -1;
 };
 
 // ---------------------------------------------------------------------------

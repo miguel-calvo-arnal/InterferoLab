@@ -66,7 +66,7 @@ cp backend/analysis/build-linux/analysis_backend.cpython-3*.so backend/analysis/
 # Run (from the project root: output/ and data/ resolve against the cwd)
 .venv/bin/python main.py
 
-# Tests (307, no hardware needed, ~4-8 s)
+# Tests (540, no hardware needed, ~5-10 min)
 .venv/bin/python -m pytest
 
 # Full release: compiles the backend, freezes into dist/ and archives into
@@ -133,6 +133,7 @@ prerequisites: `backend/analysis/compile_notes.txt`.
 | `tests/README.md` | Test suite structure and documented conventions |
 | `backend/analysis/compile_notes.txt` | Building the C++ backend (Linux and Windows/vcpkg) |
 | `scripts/build_release.sh` · `.ps1` · `.bat` | Full release chain (backend → PyInstaller → `releases/`); each header documents requirements and options; the `.bat` is the Windows double-click launcher |
+| `scripts/method_accuracy_bench.py` | Synthetic accuracy bench of the four reconstruction methods (known heights, off-grid, with and without noise): prints the error budget of each method and exits non-zero if one degrades. Run it after touching `compute_envelope()` or the height locators |
 | `backend/analysis/how_to_add_a_method.txt` | How to add a reconstruction method |
 | `API/README.md` | The proprietary piezo SDK and where to place it |
 | `install/README.md` | Deployment payloads and the MSVC runtime story |
@@ -140,8 +141,18 @@ prerequisites: `backend/analysis/compile_notes.txt`.
 
 ## Status
 
-Code audited and fixed (July 2026; see `CHANGELOG.md`). Still pending **lab**
-validation of the real-hardware paths (camera/piezo connection, exclusions,
-movement cancellation, exposure verification) — details in `TODO.md`. The
-Windows `.pyd` is rebuilt with the current CMake and the frozen executable
-verified there (August 2026).
+Code audited and fixed (July 2026; see `CHANGELOG.md`). Since then: the
+acquisition was rebuilt around a single camera-owner thread with a streaming
+preview, non-blocking error handling, the measured piezo position in the window
+and a `positions.csv` per sweep (September 2026); and Methods 3 and 4 of the
+reconstruction engine were corrected, λ₀ set to 570 nm and the band sampling made
+reproducible (September 2026, commit `66e9d31` — see `CHANGELOG.md`). Published
+Method 3 and Method 4 results from before that commit do not reproduce with the
+current binary.
+
+Still pending **lab** validation of the real-hardware paths (camera/piezo
+connection, exclusions, movement cancellation, exposure verification) — details
+in `TODO.md`. The Windows `.pyd` was rebuilt with the current CMake and the
+frozen executable verified there in August 2026, so **it predates the September
+backend changes and must be rebuilt before the next release**; the same applies
+to any `cpython-313` module left next to the current one.

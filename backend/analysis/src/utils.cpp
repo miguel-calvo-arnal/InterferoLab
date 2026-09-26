@@ -18,6 +18,7 @@
 #include <vector>
 #include <numeric>
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
@@ -77,14 +78,55 @@ std::uint64_t get_free_ram_bytes()
 }
 
 // ------------------------------------------------------------
+//   Limits every row-chunk size must respect
+// ------------------------------------------------------------
+// SINGLE place where the bounds of R live.  The floor of 16 is not cosmetic:
+// cfg::BAND_SAMPLE_ROWS relies on the first chunk always holding at least 16
+// rows (or the whole image, when it is shorter), because that is what makes
+// the band sample of Methods 2 and 4 independent of the chunking.  Every path
+// that produces an R — the RAM estimate, the fallback constant and the
+// INTERFEROLAB_ROW_CHUNK override — goes through here.
+static int clamp_row_chunk(int R, int Ny)
+{
+    if (R < 16)
+        R = 16;
+    if (R > 4096)
+        R = 4096;
+    if (Ny > 0 && R > Ny)
+        R = Ny;
+    return R;
+}
+
+// ------------------------------------------------------------
 //   Auto-select chunk size based on RAM + image shape
 // ------------------------------------------------------------
 int auto_row_chunk(int Nx, int Ny, int Nz, double safety_ratio)
 {
+    // Override for tests and diagnostics: INTERFEROLAB_ROW_CHUNK forces the
+    // number of rows per chunk, so a caller can reconstruct the same dataset
+    // with several chunk sizes and check that the result does not depend on
+    // them (tests/test_reproducibility.py).  It is the only supported way to
+    // make the chunking differ without changing the machine's free RAM, and
+    // it is deliberately NOT read from the app's configuration: nothing in
+    // normal use should touch it.
+    //
+    // It goes through THE SAME clamps as the RAM-derived value (16 ≤ R ≤ 4096,
+    // and R ≤ Ny).  Without that, a forced value below the floor would shrink
+    // the band-sample grid of cfg::BAND_SAMPLE_ROWS — 8 rows give 128 traces
+    // instead of 256 — and the knob meant to PROVE the reconstruction is
+    // chunk-independent would instead be the one way to break it.  The
+    // override can only produce chunkings the application itself can produce.
+    if (const char *env = std::getenv("INTERFEROLAB_ROW_CHUNK"))
+    {
+        int forced = std::atoi(env);
+        if (forced > 0)
+            return clamp_row_chunk(forced, Ny);
+    }
+
     std::uint64_t free_ram = get_free_ram_bytes();
 
     if (free_ram == 0)
-        return cfg::ROW_CHUNK_SIZE; // fallback
+        return clamp_row_chunk(cfg::ROW_CHUNK_SIZE, Ny); // fallback
 
     // Only allow a safe fraction of available RAM to be used
     std::uint64_t allowed_ram = std::uint64_t(double(free_ram) * safety_ratio);
@@ -95,20 +137,10 @@ int auto_row_chunk(int Nx, int Ny, int Nz, double safety_ratio)
                                   sizeof(float);
 
     if (per_row_bytes == 0)
-        return cfg::ROW_CHUNK_SIZE; // fallback
+        return clamp_row_chunk(cfg::ROW_CHUNK_SIZE, Ny); // fallback
 
-    // Maximum number of rows fitting into allowed RAM
-    int R = int(allowed_ram / per_row_bytes);
-
-    // Reasonable limits
-    if (R < 16)
-        R = 16;
-    if (R > 4096)
-        R = 4096;
-    if (R > Ny)
-        R = Ny;
-
-    return R;
+    // Maximum number of rows fitting into allowed RAM, within the limits.
+    return clamp_row_chunk(int(allowed_ram / per_row_bytes), Ny);
 }
 
 // Convert a string to lowercase.

@@ -504,6 +504,220 @@ binned mono merge.
 **Data taken on 2026-09-08 is affected**: colour stacks have R and B swapped,
 and mono stacks were merged with the red and blue weights exchanged.
 
+## The analysis no longer depends on the machine's free memory (2026-09-24)
+
+Same corrections batch, second block. Found by the numeric reviewer while
+checking the Method 3 and 4 changes above; the defect itself is **older than
+this batch** and was never introduced by it.
+
+### Why
+
+The backend streams a dataset in row-chunks whose size `auto_row_chunk()`
+derives from `MemAvailable` at that instant. That is harmless for every
+per-pixel computation — they are independent of how the image is split — but
+one value is not per-pixel: Methods 2 and 4 estimate a single bandpass
+`{k_avg, dk}` from a sample of Z-traces and then apply it to **every** pixel of
+the image. The sample was "256 pixels of the first chunk, with a stride of
+(R·Nx)/256". Different free RAM → different R → a different set of 256 pixels →
+a different mean amplitude spectrum → `dk` one bin away → a different band for
+the whole image.
+
+Measured on `data/S1F1` (1216×1936, 453 frames) by forcing the chunk size, and
+independently by faking `/proc/meminfo` in a user namespace: the band moved
+from {45, 103} to {45, 104} and **99.95 % of the Method 2 heights changed**, by
+up to 22.7 nm. On `data/S1F5`, 99.97 % of them, by up to 58.6 nm. Methods 1 and
+3 never read the band and were bit-identical throughout. It was not OpenMP and
+not FFTW: with a fixed chunk size the backend is already deterministic
+(`FFTW_ESTIMATE`, `schedule(static)`, independent pixels).
+
+Two runs of the same dataset on the same machine could therefore disagree —
+and did, which is how it surfaced: an analysis launched right after another one
+saw a different `MemAvailable` because of the page cache.
+
+### What changed
+
+- `reconstruction.cpp`: the bandpass sample is now a fixed grid,
+  `cfg::BAND_SAMPLE_ROWS` × `cfg::BAND_SAMPLE_COLS` = 16 × 16 = 256 pixels,
+  over the first 16 rows of the image and across its full width. 16 rows is the
+  floor `auto_row_chunk()` is allowed to return, so the grid is always fully
+  present in the first chunk whatever the memory, and the sample is identical
+  on every machine and every run. The count of samples and the estimator are
+  unchanged. A band of rows samples the mean *amplitude* spectrum as well as a
+  scattered set does, because a height difference only moves the phase of the
+  transform, not its modulus.
+- `analysis_api` / `run_analysis`: the result now carries `k_avg` and `dk`
+  (−1 for Methods 1 and 3). It is the only quantity the whole image shares, so
+  reporting it is what lets a caller — or a test — see that two runs did the
+  same analysis.
+- `utils.cpp`: `auto_row_chunk()` honours `INTERFEROLAB_ROW_CHUNK`, a
+  test/diagnostic override for the chunk size. It is the knob that lets a test
+  vary the chunking without changing the machine's memory; nothing in normal
+  use sets it. The forced value goes through the same limits as the RAM
+  estimate (16 ≤ R ≤ 4096, R ≤ Ny), which now live in one function: a value
+  below the floor would otherwise shrink the sampling grid (8 rows → 128
+  traces) and the knob meant to prove chunk-independence would be the one way
+  to break it. The two RAM-less fallbacks are clamped to Ny as well, which they
+  were not.
+
+### What it changes in the results
+
+Methods **1 and 3 do not move at all** (bit-identical on both real stacks and
+on the whole synthetic bench): they have no global band. Methods 2 and 4 move
+wherever the fixed grid picks a different band from the old sample:
+
+| Stack | M2 | M4 |
+|---|---|---|
+| `data/S1F1` | unchanged (bit-identical) | 99.93 % of pixels, std 0.76 nm, max 39.7 nm; S_q 6.797 → 6.813 |
+| `data/S1F5` | 99.97 % of pixels, std 1.32 nm, max 58.6 nm; S_q 28.235 → 28.154 | unchanged |
+| synthetic bench | `clean`, `noisy`, `centre` unchanged; `asym` 62 % of pixels, max 3.2 nm | `clean`, `noisy`, `centre` unchanged; `asym` 97 % of pixels, max 2.4 nm |
+
+(S_q with `scripts/flat_noise_analysis.py`, the script behind every published
+table.) The height maps of Methods 2 and 4 must therefore be recomputed. Over
+the **eight datasets re-run for this change** their S_q moves **between 0.000
+and 1.19 nm**: the largest is 163.94 → 165.13 nm on the 2026-05-21(a) raw
+dataset with Method 2, i.e. 0.7 %. The two stacks in the table above, which are
+the smallest of the set, move 0.02 and 0.08 nm — do not take those as the
+bound. Methods 1 and 3 need no re-run.
+
+### What this does NOT fix
+
+The fixed grid buys reproducibility, **not** independence from the sample.
+`dk = ceil(2·sqrt(var))` and, on both real stacks, `2·sqrt(var)` sits within
+±0.3 bins of an integer while its spread over different 256-trace samples is
+±0.3–0.5 bins, so no sample of that size pins `dk` down. On `data/S1F1` the
+grid gives `dk` = 103 and 64 % of 200 random samples agree; on `data/S1F5` the
+grid gives 53 and the **majority** of random samples (62 %) give 54. The grid
+fixes the answer by convention, and one bin of `dk` is worth 1.3–1.4 nm of
+height dispersion in Method 2. The grid also reads the top 16 rows, whose DC is
+~4 % lower on S1F1, which puts its estimate about 2σ below the mean of random
+samples. Making Methods 2 and 4 independent of that convention needs a
+different `dk` estimator (a coarser grain, or many more traces), not a
+different sample. That is a design decision and it is not taken here; it is
+recorded in `config.hpp` next to `BAND_SAMPLE_ROWS`.
+
+### Tests
+
+`tests/test_reproducibility.py`: the same scan reconstructed with several
+forced chunk sizes must give the same band and a bit-identical height map, on
+two synthetic fields whose spectrum varies down the image and — when
+`data/S1F1` is present — on the real stack, which is the case that actually
+failed before the fix. Plus two guards: that `BAND_SAMPLE_ROWS` never exceeds
+the 16-row floor which makes the grid available in the first chunk, and that a
+forced chunk size below that floor is clamped up to it instead of shrinking the
+grid.
+
+## Methods 3 and 4 fixed; reference wavelength set to 570 nm (2026-09-24)
+
+Corrections batch, backend block. They come from the physical-mathematical
+verification of 2026-09-23 (findings D1-09/10/11, D1-12 and D1-18), and all
+three were decided by Miguel. **The published results of Methods 3 and 4
+change; Methods 1 and 2 do not move at all.**
+
+### Why
+
+- **Method 4 averaged angles.** The envelope position appears in the spectrum
+  as a linear phase ramp, and the method read its slope as the
+  amplitude-weighted mean of `arg(FFT[k+1]·conj(FFT[k]))` bin by bin. That is
+  wrong in two measured ways. When the envelope sits near the middle of the
+  scan the true per-bin step is exactly ±π, so `atan2` returns +π for some
+  bins and −π for others and their arithmetic mean collapses to ≈ 0, placing
+  the surface at the bottom of the scan (error Nz·Δz/2 ≈ 2.7 µm on a
+  300-frame, 20 nm scan). And the band half-width `dk/2` comes from the
+  second moment of the whole amplitude spectrum, which the noise floor
+  inflates — on a real stack, 315 bins around a peak only ~12 bins wide — so
+  hundreds of signal-free bins, each with a uniformly random angle, got a
+  vote. Together they explain the S_q of 431–1188 nm published for Method 4.
+- **Method 3 returned grid positions.** `find_envelope_peak()` reported the
+  scan position of the discrete envelope maximum, so every height was
+  quantised to the axial step: a uniform ±Δz/2 error, i.e. an rms floor of
+  Δz/√12 = 5.8 nm at 20 nm and 8.7 nm at 30 nm. That floor is inside the
+  published S_q of Method 3 (8.1 nm on the 2026b dataset contains 5.8 nm of
+  pure quantisation) and is what the "multiple peaks" of its height histogram
+  really are: the Δz levels, not a phase-step calibration problem.
+- **`LAMBDA0_NM` was 3–4 % low.** 550 nm was a rounded nominal value. The
+  Bayer-weighted spectral centroid of the detected light is 566 nm, and the
+  carrier the interferometer actually produces is longer still — the measured
+  fringe period on a raw superpixel scan is ≈ 0.287 µm (λ_eff ≈ 575 nm),
+  because the finite NA of the Mirau objective stretches the period by
+  (1 + cos θ_max)/2 ≈ +2.4 % at NA ≈ 0.3.
+
+### What changed
+
+- `reconstruction.cpp`, Method 4: the estimate is now
+  `arg(Σ_k FFT[k+1]·conj(FFT[k]))` over the same band — the cross products are
+  summed as complex numbers and the angle is taken once, at the end. The two
+  ±π contributions then add coherently instead of cancelling, and each bin
+  contributes a vector of length |FFT[k+1]|·|FFT[k]|, so noise bins weigh
+  quadratically less and cancel against one another. Same band, same loop, one
+  `atan2` instead of one per bin: the cost is unchanged.
+- `reconstruction.cpp`, `find_envelope_peak()` (used only by Method 3): the
+  maximum is refined by a parabola through it and its two neighbours, giving
+  sub-step resolution. The refinement is skipped when the maximum is at either
+  end of the scan or when the three samples are not concave, and the offset is
+  clamped to ±½ step. **Known and accepted cost, documented in the function:**
+  a parabola is symmetric, so on a skewed envelope its vertex is pulled
+  towards the wider side. Measured on a split-normal envelope (trailing side
+  1.6× wider): the discrete locator read −103.60 nm low and the parabola reads
+  −103.62 nm. So those ~104 nm are **not** the price of the refinement — they
+  are produced by the envelope smoothing (`ENVELOPE_SIGMA` = 15 samples) acting
+  on a skewed envelope, a symmetric filter dragging the maximum of an
+  asymmetric curve towards its wide side. The kernel's own, unsmoothed maximum
+  is only −16 nm off at that skew, −35 nm at 2.5× and −43 nm at 3.5×; after the
+  smoothing it becomes −100, −200 and −276 nm. The bias is therefore shared
+  with Method 1 and is reduced by lowering σ_e, not by changing the peak
+  locator. What the parabola itself adds stays below 0.5 nm for skews from 1.0
+  to 5.0, with and without noise, while it removes 5.8 nm of quantisation. A
+  systematic offset common to every pixel cancels in height differences, which
+  is what this instrument measures.
+- `config.hpp`: `LAMBDA0_NM` 550 → **570 nm**, between the 566 nm centroid and
+  the ≈ 575 nm measured carrier, within 1 % of either, with the derivation in
+  the comment. It is read only by Method 3's phase step α (now 0.441 rad
+  instead of 0.457). Measured effect on real heights: median −0.2 nm, and 13
+  pixels out of 2.35 million move by more than 100 nm (noisy pixels whose
+  global maximum flips). `NOMINAL_DZ_NM` keeps its value, with a measured note
+  that a 1.5× mismatch in α moves the heights by < 0.1 nm.
+- `methods.hpp`: the two method descriptions shown in the GUI now say what the
+  methods do.
+
+### Measured (synthetic bench, rms height error in nm)
+
+| Case | M1 | M2 | M3 before → after | M4 before → after |
+|---|---|---|---|---|
+| clean (12-bit only) | 1.3 | 0.7 | 5.78 → **0.23** | 88.5 → **0.85** |
+| noisy (σ = 5 % of the fringe) | 10.3 | 17.3 | 14.5 → **13.6** | 808 → **8.9** |
+| envelope at the scan centre | 9.4 | — | — | 2327 → **8.6** |
+| asymmetric envelope | 0.8 | — | 5.79 → **0.34** | — |
+
+"rms" above is the dispersion of the height error with its mean removed; on
+the asymmetric case the mean itself is −103.6 nm (previous paragraph).
+
+M1 and M2 are bit-for-bit identical before and after, on the synthetic bench
+and on the 2.35-Mpixel real stack `data/S1F5` (max |diff| = 0.00 nm) — with the
+same row-chunking on both runs, which before the fix below was not something a
+caller could take for granted. On that real stack the spread of M4 against M1
+falls from 83 nm to 30 nm (robust standard deviation) and its 1–99 % range from
+[−204, +132] nm to [−18, +62] nm. Its texture parameter S_q goes 43.4 → 13.1 nm,
+next to the 11.2 nm of Method 1. With `scripts/flat_noise_analysis.py`, which is
+what produced every published table, Method 3 on that stack goes
+**11.80 → 7.97 nm**, and √(11.80² − 8.66²) = 8.01 with 8.66 nm = 30/√12: the
+whole improvement is the quantisation floor of its 30 nm step, nothing else.
+
+### Tests
+
+New: `scripts/method_accuracy_bench.py`, a standalone reproducible bench that
+builds synthetic interferograms of known height (heights deliberately off the
+axial grid, one fringe phase per pixel), measures the error of every method
+and exits non-zero if any exceeds its budget. `tests/test_method_accuracy.py`
+runs it inside the suite and adds the invariance test: M1 and M2 are compared
+bit-for-bit against reference height maps in `tests/refdata/`, produced by the
+backend **before** this change.
+
+### What this invalidates
+
+Every published Method 3 and Method 4 number was produced by the previous
+estimators and has to be recomputed; the report must state which backend
+version produced each table. Methods 1 and 2 need no re-run.
+
 ## A positions.csv next to every sweep (2026-09-23)
 
 Phase-2 batch 6 (asked for by Miguel).

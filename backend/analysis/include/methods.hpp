@@ -62,10 +62,13 @@ struct MethodInfo
     ///          k_avg / dk estimation).
     bool needs_global_params;
 
-    /// True  → report the position of the envelope maximum (peak locator)
-    ///          instead of the weighted centroid.  Use for methods whose
-    ///          envelope is asymmetric so the centroid drifts from the peak
-    ///          (e.g. Method 3 with a broadband halogen source).
+    /// True  → report the position of the envelope maximum (peak locator,
+    ///          parabolically refined to sub-step precision) instead of the
+    ///          weighted centroid.  Use for methods whose envelope is
+    ///          asymmetric so the centroid drifts from the peak (e.g. Method 3
+    ///          with a broadband halogen source).  See find_envelope_peak()
+    ///          in reconstruction.cpp for the bias the parabola introduces on
+    ///          an asymmetric envelope.
     bool use_peak_locator;
 
     /// Minimum number of Z-frames (images) this method needs to produce a
@@ -108,8 +111,10 @@ inline constexpr MethodInfo RECONSTRUCTION_METHODS[] = {
         3,
         "PSI 5-point kernel",
         "5-point PSI correlation kernel (Larkin 1996): "
-        "|S_z| = sqrt((2I_{z-1}-2I_{z+1})^2 + (-I_{z-2}+2I_z-I_{z+2})^2). "
-        "DC-insensitive; fast; good for high-fringe-density acquisitions.",
+        "|S_z| = sqrt((2I_{z-1}-2I_{z+1})^2 + (-I_{z-2}+2I_z-I_{z+2})^2), "
+        "with the envelope maximum refined to sub-step precision by a "
+        "3-point parabola. DC-insensitive; fast; good for high-fringe-density "
+        "acquisitions.",
         /*needs_baseline_removal=*/false,
         /*needs_global_params=*/false,
         /*use_peak_locator=*/true,
@@ -118,9 +123,9 @@ inline constexpr MethodInfo RECONSTRUCTION_METHODS[] = {
     {
         4,
         "Frequency-domain linear fit",
-        "Per-bin phase-difference estimator: weighted mean of "
-        "arg(FFT[k+1]*conj(FFT[k])) in the carrier band. "
-        "No phase unwrapping; robust for any n_peak in [0, Nz) "
+        "Group-delay estimator: arg of the SUM of the cross products "
+        "FFT[k+1]*conj(FFT[k]) over the carrier band (vector average). "
+        "No phase unwrapping and no singularity at n_peak = Nz/2 "
         "(de Groot & Deck 1995).",
         /*needs_baseline_removal=*/true,
         /*needs_global_params=*/true,

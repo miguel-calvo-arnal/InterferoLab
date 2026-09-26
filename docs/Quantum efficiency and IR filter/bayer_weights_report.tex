@@ -45,25 +45,37 @@
 \section{Motivation}
 
 The Thorlabs LP126CU is a color CMOS sensor with a \textbf{Bayer color
-filter array} (CFA) in RGGB pattern\@. Each physical pixel measures only
+filter array} (CFA) in \textbf{BGGR} pattern\@. Each physical pixel measures only
 one of the three colors, according to its position in the $2\times 2$
 grid:
 
 \begin{center}
 \begin{tabular}{|c|c|}
 \hline
-R & G\textsubscript{1} \\
+B & G\textsubscript{1} \\
 \hline
-G\textsubscript{2} & B \\
+G\textsubscript{2} & R \\
 \hline
 \end{tabular}
 \end{center}
 
+\noindent\emph{Corrected in September 2026: this report previously said RGGB and
+drew the block with $R$ at the top left. The sensor reports
+\texttt{filter\_array\_phase = "blue"}, i.e.\ \textbf{BGGR}, and the application
+now reads that phase from the camera instead of assuming it. The weights derived
+below are unaffected, because they depend only on the \emph{count} of photosites
+per block (one red, two green, one blue) and not on their arrangement; what the
+pattern fixes is which photosite of the block receives $w_R$ and which receives
+$w_B$.}
+
 Coherence scanning interferometry (CSI) works with a \emph{monochrome}
 intensity signal: the gray value of each position $(y,x)$ as a function
 of the axial position $z$. To exploit the signal of all colors without
-resorting to demosaicing (which introduces spurious harmonics, see the
-\emph{Camera characterization report}), each $2\times 2$ block is
+resorting to demosaicing (which correlates neighbouring pixels at the CFA
+period and produces a measurable spike at 0.5~cycles/pixel in the reconstructed
+height maps; see the \emph{Camera characterization report}, whose earlier
+attribution of the second fringe harmonic to demosaicing has been
+withdrawn), each $2\times 2$ block is
 collapsed into a single \textbf{superpixel}:
 \begin{equation}
   I_{\mathrm{sp}} = w_R\,R + w_{G_1}\,G_1 + w_{G_2}\,G_2 + w_B\,B.
@@ -101,7 +113,7 @@ the received signal:
   w_c \propto S_c, \qquad \sum_c w_c = 1.
   \label{eq:weights}
 \end{equation}
-The RGGB block contains \emph{two} green pixels for every red and blue
+The Bayer block contains \emph{two} green pixels for every red and blue
 one, so the normalization denominator is $S_R + 2S_G + S_B$, not
 $S_R + S_G + S_B$:
 \begin{equation}

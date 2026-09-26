@@ -1,7 +1,8 @@
 # InterferoLab test suite
 
-**307 tests**, all runnable **without hardware** (camera and piezo are mocked;
-Qt runs offscreen). Total duration: ~4–8 s.
+**540 tests**, all runnable **without hardware** (camera and piezo are mocked;
+Qt runs offscreen). Total duration: ~5–10 min (the simulator, timing and
+performance-gate tests dominate; the rest still run in seconds).
 
 ## Running
 
@@ -33,13 +34,18 @@ Configuration lives in `pyproject.toml` (`[tool.pytest.ini_options]`) and
 | `test_acquisition_service.py` | 15 | Qt service: exclusions, signals, shutdown, double start |
 | `test_piezo_slider.py` | 16 | Piezo slider: loop-free sync, move on release only, indicator, states |
 | `test_superpixel_end_to_end.py` | 3 | Mocked sweep in superpixel mode → C++ analysis reconstructs (bin12 and png) |
-| `test_backend_api.py` | 6 | pybind API: methods, errors, progress, raising callback |
+| `test_backend_api.py` | 8 | pybind API: methods, errors, progress, raising callback, result-dict contract including the global band `k_avg`/`dk` |
 | `test_backend_reconstruction.py` | 13 | M1–M4 on synthetic interferograms of known height; PNG vs bin12; metadata; pixel plots |
 | `test_backend_errors.py` | 15 | Insufficient frames, corrupt headers, mixed dimensions, cancellation, atomic rename |
 | `test_viewmodels.py` | 28 | numpy→pixmap, histogram, signal wiring, progress monotonicity, dataset regex |
 | `test_panels_construction.py` | 11 | Offscreen construction of panels/MainWindow, warning-free QSS, heightmap with NaN |
 | `test_ui_states.py` | 20 | Button state matrix, freezing during sweep/analysis, incomplete-dataset warning, tilt variants |
 | `test_theme_and_shortcuts.py` | 11 | StatusBar, shortcuts, tooltip coverage (100%), palette, icons, unicode regression |
+| `test_method_accuracy.py` | 8 | Accuracy gate of `scripts/method_accuracy_bench.py`: M3 sub-step resolution, M4 at the scan centre, M3 bias on a skewed envelope, and **M1/M2 bit-identical to the pre-September-2026 backend** (`refdata/`) |
+| `test_reproducibility.py` | 14 | The result must not depend on the row-chunking, i.e. on the machine's free RAM: same band `{k_avg, dk}` and bit-identical height maps across chunk sizes, on two synthetic fields and (when `data/S1F1` is present) on the real stack; plus the guards on the sampling grid and on the chunk floor |
+
+> The per-file counts in this table (and the files missing from it) predate the
+> simulator and phase-2 work; `pytest --collect-only -q` prints the real ones.
 
 Shared helpers: `helpers_acquisition.py` (FakeCamera/FakePiezo/FakeSession) and
 `helpers_backend.py` (generator of synthetic CSI interferograms of known height).
@@ -50,6 +56,12 @@ Shared helpers: `helpers_acquisition.py` (FakeCamera/FakePiezo/FakeSession) and
   `h_reported = z_max − h_real`.
 - Progress percentages may jump during parallel reading (always monotonically
   non-decreasing).
+- `INTERFEROLAB_ROW_CHUNK` forces the row-chunk size. It exists **only** so
+  `test_reproducibility.py` can vary the chunking without changing the
+  machine's free memory; nothing in the application sets it. The forced value
+  goes through the same limits as the RAM estimate (16 ≤ R ≤ 4096, R ≤ Ny), so
+  asking for 8 rows gives 16: the knob cannot produce a chunking the
+  application could not, and in particular cannot shrink the band-sample grid.
 
 ## Real bugs caught by this suite
 

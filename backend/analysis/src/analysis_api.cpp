@@ -280,6 +280,8 @@ AnalysisResultPaths run_analysis_for_folder(
 
     result.output_folder = final_folder.string();
     result.heightmap_npy = height_npy.string();
+    result.k_avg = recon_k_avg;
+    result.dk = recon_dk;
 
     log("info", "Analysis finished. Output folder: " + result.output_folder);
     return result;

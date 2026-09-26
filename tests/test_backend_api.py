@@ -57,13 +57,28 @@ def test_result_dict_contract_on_normal_run(png_dataset):
     """
     result = hb.run_backend(png_dataset["folder"], name="", method=1)
 
-    assert set(result.keys()) == {"output_folder", "heightmap", "cancelled"}
+    assert set(result.keys()) == {"output_folder", "heightmap", "cancelled", "k_avg", "dk"}
     assert result["cancelled"] is False
     assert os.path.isdir(result["output_folder"])
     assert os.path.basename(result["output_folder"]) == "dataset"
     assert os.path.isfile(result["heightmap"])
     assert os.path.dirname(result["heightmap"]) == result["output_folder"]
     assert result["heightmap"].endswith("dataset_height.npy")
+    # Method 1 has no global bandpass; Methods 2 and 4 report the one they used.
+    assert (result["k_avg"], result["dk"]) == (-1, -1)
+
+
+@pytest.mark.parametrize("method", [2, 4])
+def test_global_band_is_reported_for_the_methods_that_have_one(png_dataset, method):
+    """Methods 2 and 4 share one {k_avg, dk} across the whole image.
+
+    It is the only value of the reconstruction that is not computed per pixel,
+    so the API reports it: two runs of the same dataset that disagree on it did
+    not do the same analysis (see tests/test_reproducibility.py).
+    """
+    result = hb.run_backend(png_dataset["folder"], name=f"band{method}", method=method)
+    assert result["k_avg"] > 0
+    assert result["dk"] > 0
 
 
 def test_progress_callback_monotonic(png_dataset):

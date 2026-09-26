@@ -36,6 +36,18 @@ std::uint64_t get_free_ram_bytes();
  * @param safety_ratio Fraction of available RAM allowed to be used (0–1).
  *
  * @return Optimal row‑chunk size R.
+ *
+ * @note The returned value depends on the machine's free RAM, so it is NOT
+ *       reproducible across runs.  Nothing that reaches the height of a pixel
+ *       may depend on it; see cfg::BAND_SAMPLE_ROWS for the one place that
+ *       used to.
+ * @note The environment variable `INTERFEROLAB_ROW_CHUNK`, when set to a
+ *       positive integer, overrides the RAM estimate.  It exists so tests can
+ *       prove that the reconstruction is independent of the chunking; it is
+ *       not part of the application's configuration.  The forced value goes
+ *       through the SAME limits as the estimate (16 ≤ R ≤ 4096, R ≤ Ny), so
+ *       it can only produce a chunking the application could produce on its
+ *       own: asking for 8 rows gives 16, not 8.
  */
 int auto_row_chunk(int Nx, int Ny, int Nz, double safety_ratio = cfg::AVAILABLE_RAM_RATIO_USED);
 

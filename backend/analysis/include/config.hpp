@@ -84,8 +84,60 @@ namespace cfg
      *
      * Used by auto_row_chunk() to avoid running out of memory on large datasets.
      * Typical values: 0.5–0.9.
+     *
+     * NOTE: the row-chunk size therefore depends on how much memory the machine
+     * happens to have free.  That is fine for every per-pixel computation (they
+     * are independent), but it must NEVER reach a value that is shared by all
+     * pixels — see BAND_SAMPLE_ROWS below for the one place where it did.
      */
     inline constexpr float AVAILABLE_RAM_RATIO_USED = 0.8f;
+
+    /**
+     * @brief Size of the FIXED pixel grid that estimates the global bandpass.
+     *
+     * Methods 2 and 4 derive one pair {k_avg, dk} for the whole image from a
+     * sample of Z-traces, and then apply that same band to every pixel.  The
+     * sample must not depend on anything outside the dataset, or the result of
+     * the analysis stops being reproducible.
+     *
+     * It used to: the sample was "256 pixels of the first row-chunk, with a
+     * stride of (R·Nx)/256", and R comes from auto_row_chunk(), i.e. from
+     * MemAvailable at that instant.  A different amount of free RAM gave a
+     * different R, a different set of 256 pixels, a different mean amplitude
+     * spectrum and — through one bin of dk — a different band for EVERY pixel.
+     * Measured on data/S1F1 by faking /proc/meminfo (report C3 §5.2):
+     * 99.95 % of the Method 2 pixels changed, std 1.4 nm, max 22.7 nm.
+     * Methods 1 and 3 never read {k_avg, dk} and were unaffected.
+     *
+     * The sample is now a fixed BAND_SAMPLE_ROWS × BAND_SAMPLE_COLS grid over
+     * the first rows of the image, spanning its full width.  16 rows is what
+     * auto_row_chunk() is guaranteed to deliver (its floor is 16, and it never
+     * returns more than Ny), so the grid is identical for every chunk size,
+     * every machine and every run.  16 × 16 = 256 keeps the old sample count,
+     * and the mean AMPLITUDE spectrum barely depends on which pixels are
+     * chosen: a height change only shifts the phase of the transform, not its
+     * modulus, so a band of rows is as good a sample as a scattered one.
+     *
+     * WHAT THIS DOES NOT BUY  (measured, report C3 §S3 — read before trusting
+     * dk to a bin)
+     * -----------------------------------------------------------------------
+     * The fixed grid buys REPRODUCIBILITY, not independence from the sample.
+     * dk = ceil(2·sqrt(var)) and, on both real stacks, 2·sqrt(var) sits within
+     * ±0.3 bins of an integer, while its spread over different 256-trace
+     * samples is ±0.3–0.5 bins.  So no sample of 256 traces pins dk down: on
+     * data/S1F1 the grid gives dk = 103 and 64 % of 200 random samples agree,
+     * 36 % give 104; on data/S1F5 the grid gives 53 and the MAJORITY (62 %)
+     * of random samples give 54.  The grid fixes the answer by convention, and
+     * one bin of dk is worth 1.3–1.4 nm of height dispersion in Method 2.
+     * There is also a small structural bias: the grid reads the top 16 rows,
+     * whose DC is ~4 % lower on S1F1, which puts its 2·sqrt(var) about 2σ
+     * below the mean of random samples.  Making Methods 2 and 4 independent of
+     * that convention needs a different dk estimator (a coarser grain, or many
+     * more traces), not a different sample; that is a design decision, not a
+     * bug, and it is not taken here.
+     */
+    inline constexpr int BAND_SAMPLE_ROWS = 16;
+    inline constexpr int BAND_SAMPLE_COLS = 16;
 
     /**
      * @brief RGB‑to‑grayscale weights for colour TIFF images.
@@ -113,19 +165,46 @@ namespace cfg
      *
      *   λ₀ ≈ Σ_c w_c ⟨λ⟩_c  (Bayer weights × per-channel mean wavelength)
      *
-     * For the LP126CU + Olympus U-LH100IR (3200 K) system this evaluates to
-     * approximately 550 nm.  Used ONLY by Method 3 (PSI 5-point) to compute
-     * the inter-frame phase step α = 4π δz / λ₀.  If the lamp or objective
-     * changes, re-run compute_bayer_weights.py and update this value.
+     * For the LP126CU + Olympus U-LH100IR (3200 K) system that integral gives
+     * 566 nm.  Used ONLY by Method 3 (PSI 5-point) to compute the inter-frame
+     * phase step α = 4π δz / λ₀.  If the lamp or objective changes, re-run
+     * compute_bayer_weights.py and update this value.
+     *
+     * The value used here is 570 nm, NOT the 566 nm of the centroid, because
+     * what Method 3 needs is the wavelength of the fringe carrier it actually
+     * sees, and the carrier is longer than the spectral centroid:
+     *
+     *   - measured fringe period on a raw superpixel scan: ≈ 0.287 µm, i.e.
+     *     λ_eff = 2 · period ≈ 575 nm (the finite NA of the Mirau objective
+     *     stretches the period by (1 + cos θ_max)/2 ≈ +2.4 % at NA ≈ 0.3);
+     *   - Bayer-weighted spectral centroid of the detected light: 566 nm
+     *     (559–569 nm depending on the definition of "centroid").
+     *
+     * 570 nm sits between the two, within 1 % of either.  It replaces the old
+     * 550 nm, which was 3 % below the centroid and ~4 % below the measured
+     * carrier (report D1-18, 23-Sep-2026).
+     *
+     * Sensitivity: α = 4π·20/570 = 0.4410 rad instead of 0.4570 rad.  The
+     * kernel of Method 3 only needs α to balance its two quadrature terms, so
+     * a few per cent of error leaves a 1–4 % fringe ripple on the envelope
+     * that ENVELOPE_SIGMA removes; the reconstructed heights move by far less
+     * than the axial step.  Methods 1, 2 and 4 do not read this constant.
      */
-    inline constexpr double LAMBDA0_NM = 550.0;
+    inline constexpr double LAMBDA0_NM = 570.0;
 
     /**
      * @brief Nominal inter-frame axial step [nm] for Method 3 (PSI 5-point kernel).
      *
-     * Used to compute the inter-frame phase step α = 4π δz / λ₀ ≈ 0.457 rad.
+     * Used to compute the inter-frame phase step α = 4π δz / λ₀ ≈ 0.441 rad.
      * Must match the step size commanded to the PI P-611.ZS stage.
      * Update here if the acquisition step changes.
+     *
+     * Note (measured, 24-Sep-2026): on a dataset acquired at 30 nm this value
+     * is wrong by 1.5x, yet the reconstructed heights move by < 0.1 nm.  α
+     * only sets the relative scale of the two quadrature terms of the kernel,
+     * and the residual fringe ripple it leaves is removed by ENVELOPE_SIGMA
+     * before the peak is located.  Keeping it in step is still the right
+     * thing to do; it is not a source of height error.
      */
     inline constexpr double NOMINAL_DZ_NM = 20.0;
 
